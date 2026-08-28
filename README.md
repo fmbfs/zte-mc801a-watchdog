@@ -34,6 +34,25 @@ journalctl -u zte-watchdog | grep FAULT    # code/protocol problems only
 journalctl -u zte-watchdog | grep DETECT   # observed conditions only
 ```
 
+**A healthy watchdog is a silent one.** The per-cycle successes — `ping ok`, and
+the MTU guard's `MTU probe ok at NNNNB` — are logged at `DEBUG`, so at the
+default `INFO` an untroubled daemon writes nothing after its three startup
+lines. That is the pass signal, not a sign the checks aren't running.
+
+To watch them actually happen, raise the level:
+
+```bash
+LOG_LEVEL=DEBUG ./install_zte_watchdog.sh
+# or, without reinstalling:
+sudo sed -i 's/^LOG_LEVEL=.*/LOG_LEVEL=DEBUG/' /opt/zte-watchdog/config.env
+sudo systemctl restart zte-watchdog
+```
+
+Accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` in any case, or a bare
+number. An unrecognised value falls back to `INFO` and logs one `FAULT` line —
+a typo in a log setting should never stop the watchdog from starting. The level
+in force is echoed at startup: `LIFECYCLE | log level: DEBUG (LOG_LEVEL)`.
+
 ---
 
 ## How it works
@@ -214,6 +233,7 @@ All settings are environment variables, stored in `/opt/zte-watchdog/config.env`
 | `ROUTER_DEAD_THRESHOLD` | `3` | Cycles of unreachable admin plane before `CRITICAL` |
 | `ADMIN_DEAD_RETRY_EVERY` | `10` | Cycles between blind ladder retries while admin is dead |
 | `ROLLING_WINDOW_SECONDS` | `86400` | Breaker window |
+| `LOG_LEVEL` | `INFO` | `DEBUG` adds per-cycle heartbeats; bad values fall back to `INFO` |
 | `MTU_GUARD_ENABLED` | `1` | Enable the path-MTU guard |
 | `MTU_GUARD_DRY_RUN` | `0` | `1` = detect and measure, never write |
 | `MTU_TARGET` | *(placeholder — measure yours)* | Size the guard probes for; must match your path's real ceiling |

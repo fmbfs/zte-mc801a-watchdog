@@ -60,6 +60,13 @@ ROUTER_DEAD_THRESHOLD="${ROUTER_DEAD_THRESHOLD:-3}"
 ADMIN_DEAD_RETRY_EVERY="${ADMIN_DEAD_RETRY_EVERY:-10}"
 ROLLING_WINDOW_SECONDS="${ROLLING_WINDOW_SECONDS:-86400}"
 
+# Log verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL (or a number). DEBUG
+# adds the per-cycle heartbeats -- "ping ok" and the MTU guard's "MTU probe ok
+# at NNNNB" -- which are suppressed at INFO because a healthy watchdog is a
+# silent one. Useful when you want to see the guard working rather than infer
+# it from the absence of complaints.
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+
 # --- MTU guard (path-MTU black-hole detector; see mtu_guard section below) ---
 # The goform contract (SET_DEVICE_MTU / mtu / tcp_mss) is confirmed against
 # this firmware's own admin bundle, so corrections are live by default.
@@ -260,9 +267,43 @@ class _AlignedFormatter(logging.Formatter):
             record.levelname = original
 
 
+#: Default log verbosity. Defined here rather than in the defaults block below
+#: because logging has to be configured before anything else can report.
+DEFAULT_LOG_LEVEL = "INFO"
+
+
+def _resolve_log_level(raw: Optional[str]) -> "tuple[int, Optional[str]]":
+    r"""
+    \brief Map a LOG_LEVEL value to a logging level.
+
+    \details Accepts a level name in any case ("debug", "WARNING") or a bare
+    number ("10"). An unusable value is never fatal: the daemon's job is to
+    keep the WAN up, and refusing to start over a typo in a log setting would
+    trade a working watchdog for a cosmetic one. The offending value is
+    returned so the caller can FAULT-log it once logging is alive.
+
+    \param raw  The raw environment value, or None when unset.
+    \return (level, rejected_value). rejected_value is None when raw was
+            usable or absent.
+    """
+    if raw is None or not raw.strip():
+        return logging.INFO, None
+    name = raw.strip().upper()
+    if name.isdigit():
+        return int(name), None
+    level = logging.getLevelName(name)
+    # getLevelName returns the int for a known name and the string
+    # "Level <name>" for an unknown one, so an isinstance check is the test.
+    if isinstance(level, int):
+        return level, None
+    return logging.INFO, raw.strip()
+
+
+_LOG_LEVEL, _BAD_LOG_LEVEL = _resolve_log_level(os.environ.get("LOG_LEVEL"))
+
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(_AlignedFormatter("%(asctime)s [%(levelname)s] %(message)s"))
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
+logging.basicConfig(level=_LOG_LEVEL, handlers=[_handler])
 log = logging.getLogger("zte_watchdog")
 
 # Category tags. Kept in a fixed-width second column so lines are grep-able:
@@ -321,6 +362,11 @@ DEFAULT_L2_MAX_PER_WINDOW = 8
 DEFAULT_L3_MAX_PER_WINDOW = 3
 #: Rolling window for every circuit breaker, in seconds.
 DEFAULT_ROLLING_WINDOW_S = 24 * 3600
+
+#: Router admin IP.
+DEFAULT_ROUTER_IP = "192.168.0.1"
+#: Address pinged to decide whether the WAN is usable.
+DEFAULT_PING_TARGET = "1.1.1.1"
 
 #: Top rung of the recovery ladder. escalation_level is 1-based (1=L1, 2=L2,
 #: 3=L3), so this is both the ceiling the ladder may climb to and the level
@@ -1610,9 +1656,9 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     \param cfg  Loaded configuration.
     \return Fully wired WatchdogDeps.
     """
-    router_ip = os.environ.get("ROUTER_IP", "192.168.0.1")
+    router_ip = os.environ.get("ROUTER_IP", DEFAULT_ROUTER_IP)
     password = os.environ.get("ROUTER_PASSWORD", "")
-    ping_target = os.environ.get("PING_TARGET", "1.1.1.1")
+    ping_target = os.environ.get("PING_TARGET", DEFAULT_PING_TARGET)
     boot_wait_s = float(_env_int("L3_BOOT_WAIT", DEFAULT_L3_BOOT_WAIT_S))
     l2_settle_s = float(_env_int("L2_SETTLE", DEFAULT_L2_SETTLE_S))
     l2_max = _env_int("L2_MAX_PER_WINDOW", DEFAULT_L2_MAX_PER_WINDOW)
@@ -1690,8 +1736,14 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
 def main() -> None:
     r"""\brief Entrypoint: load config, wire deps, run the poll loop forever."""
     cfg = WatchdogConfig.from_env()
+    if _BAD_LOG_LEVEL is not None:
+        _emit(logging.ERROR, TAG_FAULT,
+              "invalid LOG_LEVEL=%r -- using %s (valid: DEBUG, INFO, WARNING, ERROR, "
+              "CRITICAL, or a number)", _BAD_LOG_LEVEL, DEFAULT_LOG_LEVEL)
     _emit(logging.INFO, TAG_LIFECYCLE, "starting: interval=%ss threshold=%s cooldown=%ss L3-after=%s L2-fails admin-dead-after=%s cycles",
           cfg.check_interval_s, cfg.fail_threshold, cfg.cooldown_s, cfg.l3_escalation_threshold, cfg.router_dead_threshold)
+    _emit(logging.INFO, TAG_LIFECYCLE, "log level: %s (LOG_LEVEL)",
+          logging.getLevelName(_LOG_LEVEL))
     deps = build_deps(cfg)
     state = WatchdogState()
     consecutive_faults = 0
@@ -1770,6 +1822,8 @@ from zte_watchdog import (
     SMALL_PROBE_PAYLOAD,
     _ICMP_OVERHEAD,
     icmp_ok_sized,
+    # logging
+    _resolve_log_level,
 )
 
 # =====================================================================
@@ -2695,6 +2749,12 @@ _INSTALLER_TO_CONSTANT = {
     "MTU_MAX_PER_WINDOW": "DEFAULT_MTU_MAX_PER_WINDOW",
 }
 
+_INSTALLER_TO_CONSTANT_STR = {
+    "ROUTER_IP": "DEFAULT_ROUTER_IP",
+    "PING_TARGET": "DEFAULT_PING_TARGET",
+    "LOG_LEVEL": "DEFAULT_LOG_LEVEL",
+}
+
 _SHELL_DEFAULT_RE = re.compile(
     r'^(?P<key>[A-Z0-9_]+)="\$\{(?P=key):-(?P<val>[^}]*)\}"', re.MULTILINE)
 
@@ -2732,12 +2792,62 @@ def test_installer_defaults_match_daemon_defaults():
     missing = [k for k in _INSTALLER_TO_CONSTANT if k not in shell]
     assert not missing, f"installer no longer defines: {missing}"
 
+    missing_str = [k for k in _INSTALLER_TO_CONSTANT_STR if k not in shell]
+    assert not missing_str, f"installer no longer defines: {missing_str}"
+
     drift = []
     for key, const in _INSTALLER_TO_CONSTANT.items():
         daemon_value = getattr(zte_watchdog, const)
         if int(shell[key]) != daemon_value:
             drift.append(f"{key}: installer={shell[key]} {const}={daemon_value}")
+    for key, const in _INSTALLER_TO_CONSTANT_STR.items():
+        daemon_value = getattr(zte_watchdog, const)
+        if shell[key] != daemon_value:
+            drift.append(f"{key}: installer={shell[key]!r} {const}={daemon_value!r}")
     assert not drift, "installer and daemon defaults disagree -- " + "; ".join(drift)
+
+
+# --- LOG_LEVEL ---------------------------------------------------------------
+
+
+def test_given_no_log_level_when_resolving_then_info_and_no_complaint():
+    assert _resolve_log_level(None) == (logging.INFO, None)
+
+
+def test_given_blank_log_level_when_resolving_then_info_not_rejected():
+    r"""An EnvironmentFile line like `LOG_LEVEL=` must not be a fault."""
+    assert _resolve_log_level("   ") == (logging.INFO, None)
+
+
+def test_given_lowercase_log_level_when_resolving_then_accepted():
+    assert _resolve_log_level("debug") == (logging.DEBUG, None)
+
+
+def test_given_padded_log_level_when_resolving_then_stripped():
+    assert _resolve_log_level("  WARNING  ") == (logging.WARNING, None)
+
+
+def test_given_numeric_log_level_when_resolving_then_used_verbatim():
+    assert _resolve_log_level("25") == (25, None)
+
+
+def test_given_unknown_log_level_when_resolving_then_falls_back_and_reports():
+    level, rejected = _resolve_log_level("LOUD")
+    assert level == logging.INFO
+    assert rejected == "LOUD"
+
+
+def test_given_unknown_log_level_when_resolving_then_never_raises():
+    r"""A typo in a log setting must not stop the watchdog from starting."""
+    for bad in ("", "?", "-1x", "INFOO", "trace"):
+        level, _ = _resolve_log_level(bad)
+        assert isinstance(level, int)
+
+
+def test_given_debug_level_when_set_then_heartbeats_would_be_emitted():
+    r"""DEBUG is below the heartbeat lines the guard and poll loop emit."""
+    level, _ = _resolve_log_level("DEBUG")
+    assert level < logging.INFO
 
 
 def test_given_every_mtu_env_knob_when_mapped_then_the_table_is_complete():
@@ -2772,6 +2882,7 @@ L3_BOOT_WAIT=${L3_BOOT_WAIT}
 ROUTER_DEAD_THRESHOLD=${ROUTER_DEAD_THRESHOLD}
 ADMIN_DEAD_RETRY_EVERY=${ADMIN_DEAD_RETRY_EVERY}
 ROLLING_WINDOW_SECONDS=${ROLLING_WINDOW_SECONDS}
+LOG_LEVEL=${LOG_LEVEL}
 MTU_GUARD_ENABLED=${MTU_GUARD_ENABLED}
 MTU_GUARD_DRY_RUN=${MTU_GUARD_DRY_RUN}
 MTU_TARGET=${MTU_TARGET}
