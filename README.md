@@ -236,10 +236,18 @@ written twice — once in the installer's shell block, once as a `DEFAULT_*`
 constant in the daemon — because they are two languages sharing one file and
 cannot share a literal. `test_installer_defaults_match_daemon_defaults` parses
 the shell defaults back out of `install_zte_watchdog.sh` and asserts they equal
-the daemon's constants, so the pair can only drift loudly. It skips when run
-from `/opt` (the installer isn't copied there) and fires on every run from a
-checkout. Everything else has exactly one definition: change `DEFAULT_MTU_TARGET`
-or its `MTU_TARGET` shell counterpart and both the dataclass default and the
+the daemon's constants, so the pair can only drift loudly.
+
+It needs to find the installer, which is not one of the two files copied into
+`/opt/zte-watchdog`. So the installer exports its own absolute path as
+`ZTE_INSTALLER_PATH` when it runs the gate, and the test reads that first —
+which keeps the check live at install time, where it matters most. Running the
+suite from a checkout works without the variable, since the installer is right
+there. It skips only in the leftover case: a standalone run of the installed
+copy with no pointer set.
+
+Everything else has exactly one definition: change `DEFAULT_MTU_TARGET` or its
+`MTU_TARGET` shell counterpart and both the dataclass default and the
 environment fallback follow.
 
 ---
