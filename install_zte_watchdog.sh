@@ -40,6 +40,12 @@ set -euo pipefail
 INSTALL_DIR="/opt/zte-watchdog"
 SERVICE_NAME="zte-watchdog"
 
+# Absolute path to THIS script. The test suite's installer-vs-daemon default
+# drift check needs it: pytest runs from INSTALL_DIR, and this file is not one
+# of the two copied there, so without a pointer the check has nothing to read
+# and skips -- silently inert at exactly the moment it is most useful.
+INSTALLER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
 ROUTER_IP="${ROUTER_IP:-192.168.0.1}"
 PING_TARGET="${PING_TARGET:-1.1.1.1}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-20}"
@@ -2694,12 +2700,19 @@ _SHELL_DEFAULT_RE = re.compile(
 
 
 def _find_installer():
-    r"""\brief Locate install_zte_watchdog.sh, or None when running from /opt.
+    r"""\brief Locate install_zte_watchdog.sh, or None if it cannot be found.
 
     \details The installer copies only the daemon and this test file into
-    INSTALL_DIR, so at service-install time there is nothing to compare
-    against and the check is skipped. Run from a git checkout it always fires.
+    INSTALL_DIR, so a bare run from /opt has nothing to compare against. To
+    keep the check live at install time -- when it matters most -- the
+    installer exports its own absolute path as ZTE_INSTALLER_PATH, which is
+    consulted first. The directory search below covers the ordinary case of
+    running the suite from a git checkout. Only a standalone run of the
+    installed copy, with no pointer and no checkout nearby, still skips.
     """
+    from_env = os.environ.get("ZTE_INSTALLER_PATH")
+    if from_env and os.path.isfile(from_env):
+        return from_env
     here = os.path.dirname(os.path.abspath(__file__))
     for d in (here, os.path.dirname(here), os.getcwd()):
         cand = os.path.join(d, "install_zte_watchdog.sh")
@@ -2770,7 +2783,9 @@ chmod 600 "${CONFIG_FILE}"
 
 if [[ "${RUN_TESTS}" == "1" ]]; then
   echo "[6/7] Running mocked test suite (no hardware touched)..."
-  ( cd "${INSTALL_DIR}" && "${INSTALL_DIR}/venv/bin/python" -m pytest test_zte_watchdog.py -q )
+  ( cd "${INSTALL_DIR}" \
+      && ZTE_INSTALLER_PATH="${INSTALLER_PATH}" \
+         "${INSTALL_DIR}/venv/bin/python" -m pytest test_zte_watchdog.py -q )
 else
   echo "[6/7] Skipping tests (RUN_TESTS=0)."
 fi
