@@ -51,10 +51,23 @@ PING_TARGET="${PING_TARGET:-1.1.1.1}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-20}"
 FAIL_THRESHOLD="${FAIL_THRESHOLD:-3}"
 COOLDOWN="${COOLDOWN:-180}"
+
+# A cached router login older than this is re-authenticated before use. The
+# stok is otherwise only dropped reactively, by a request that has already
+# been rejected -- which makes the first recovery action after a long healthy
+# stretch a guaranteed write-off, sent on a dead session and still costing a
+# full COOLDOWN before anything else is tried.
+SESSION_MAX_AGE="${SESSION_MAX_AGE:-300}"
 L2_MAX_PER_WINDOW="${L2_MAX_PER_WINDOW:-8}"
-L2_SETTLE="${L2_SETTLE:-3}"
+# Seconds between DISCONNECT and CONNECT in an L2 cycle. A hand-driven toggle
+# that works tends to have a human-length pause in it; 3s appears to be too
+# short for the modem to actually drop the bearer.
+L2_SETTLE="${L2_SETTLE:-15}"
 L3_MAX_PER_WINDOW="${L3_MAX_PER_WINDOW:-3}"
-L3_ESCALATION_THRESHOLD="${L3_ESCALATION_THRESHOLD:-3}"
+# Failed L2 attempts before escalating to reboot. At 3, with COOLDOWN=180,
+# the first reboot is 12 minutes into an outage -- long enough that a human
+# beats it to the router.
+L3_ESCALATION_THRESHOLD="${L3_ESCALATION_THRESHOLD:-2}"
 L3_BOOT_WAIT="${L3_BOOT_WAIT:-90}"
 ROUTER_DEAD_THRESHOLD="${ROUTER_DEAD_THRESHOLD:-3}"
 ADMIN_DEAD_RETRY_EVERY="${ADMIN_DEAD_RETRY_EVERY:-10}"
@@ -86,6 +99,16 @@ MTU_TARGET="${MTU_TARGET:-1360}"   # <-- PLACEHOLDER: measure yours, see above
 MTU_FLOOR="${MTU_FLOOR:-1200}"
 MTU_CHECK_EVERY="${MTU_CHECK_EVERY:-900}"
 MTU_MAX_PER_WINDOW="${MTU_MAX_PER_WINDOW:-4}"
+
+# --- transport-plane check ---------------------------------------------------
+# ICMP alone cannot see a TCP-level outage: the path can answer every ping while
+# refusing every handshake. Several different operators, so one provider having
+# a bad day does not read as "the WAN is down" and trigger a router reboot.
+# Anycast resolvers stay reachable through outages that break everything else,
+# so keep at least one target that is somewhere you actually need to reach.
+TCP_CHECK_ENABLED="${TCP_CHECK_ENABLED:-1}"
+TCP_CHECK_TARGETS="${TCP_CHECK_TARGETS:-1.1.1.1:443,8.8.8.8:443,9.9.9.9:443}"
+TCP_CHECK_TIMEOUT="${TCP_CHECK_TIMEOUT:-4}"
 
 RUN_TESTS="${RUN_TESTS:-1}"
 
@@ -228,6 +251,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -346,16 +370,22 @@ DEFAULT_CHECK_INTERVAL_S = 20
 DEFAULT_FAIL_THRESHOLD = 3
 #: Seconds between recovery attempts.
 DEFAULT_COOLDOWN_S = 180
-#: Failed L2 attempts before escalating to L3.
-DEFAULT_L3_ESCALATION_THRESHOLD = 3
+#: Seconds a cached login is trusted before ensure_login() forces a fresh one.
+DEFAULT_SESSION_MAX_AGE_S = 300
+#: Failed L2 attempts before escalating to L3. At 3, with a 180s cooldown, the
+#: first reboot lands 12 minutes into an outage -- long enough that a human
+#: beats the ladder to the router.
+DEFAULT_L3_ESCALATION_THRESHOLD = 2
 #: Cycles of unreachable admin plane before declaring it dead.
 DEFAULT_ROUTER_DEAD_THRESHOLD = 3
 #: Cycles between blind ladder retries while the admin plane is dead.
 DEFAULT_ADMIN_DEAD_RETRY_EVERY = 10
 #: Seconds to wait out a soft reboot before probing for readiness.
 DEFAULT_L3_BOOT_WAIT_S = 90
-#: Seconds between DISCONNECT and CONNECT in an L2 cycle.
-DEFAULT_L2_SETTLE_S = 3
+#: Seconds between DISCONNECT and CONNECT in an L2 cycle. 3s appears to be too
+#: short for the modem to actually drop the bearer; a hand-driven toggle that
+#: works has a human-length pause in it.
+DEFAULT_L2_SETTLE_S = 15
 #: L2 attempts allowed per rolling window.
 DEFAULT_L2_MAX_PER_WINDOW = 8
 #: L3 (reboot) attempts allowed per rolling window.
@@ -367,6 +397,17 @@ DEFAULT_ROLLING_WINDOW_S = 24 * 3600
 DEFAULT_ROUTER_IP = "192.168.0.1"
 #: Address pinged to decide whether the WAN is usable.
 DEFAULT_PING_TARGET = "1.1.1.1"
+
+#: TCP targets for the transport-plane check, as "host:port,host:port".
+#: ICMP alone cannot see a TCP-level outage: a path can answer every echo while
+#: refusing to complete a single handshake, which is indistinguishable from a
+#: healthy link to a ping-only probe and looks like a dead internet to every
+#: application on the LAN. Deliberately three different operators -- one
+#: provider having a bad day must not read as "the WAN is down".
+DEFAULT_TCP_CHECK_TARGETS = "1.1.1.1:443,8.8.8.8:443,9.9.9.9:443"
+
+#: Per-connect deadline for the TCP check, in seconds.
+DEFAULT_TCP_CHECK_TIMEOUT_S = 4
 
 #: Top rung of the recovery ladder. escalation_level is 1-based (1=L1, 2=L2,
 #: 3=L3), so this is both the ceiling the ladder may climb to and the level
@@ -432,6 +473,130 @@ def icmp_ok(target: str, timeout_s: int = 2) -> bool:
     except FileNotFoundError:
         _emit(logging.ERROR, TAG_FAULT, "ping binary not found -- install iputils-ping")
         return False
+
+
+def parse_tcp_targets(raw: str) -> list[tuple[str, int]]:
+    r"""
+    \brief Parse "host:port,host:port" into (host, port) pairs.
+
+    \details Malformed entries are dropped with a warning rather than raising:
+    a typo in one target must not stop the watchdog from starting, because a
+    watchdog that refuses to run is strictly worse than one running with two
+    probes instead of three.
+
+    \param raw  Comma-separated "host:port" list.
+    \return Parsed targets, possibly empty.
+    """
+    targets: list[tuple[str, int]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        host, _, port_s = entry.rpartition(":")
+        if not host or not port_s.isdigit():
+            _emit(logging.WARNING, TAG_FAULT,
+                  "ignoring malformed TCP target %r (want host:port)", entry)
+            continue
+        targets.append((host, int(port_s)))
+    return targets
+
+
+def tcp_ok(host: str, port: int, timeout_s: int = DEFAULT_TCP_CHECK_TIMEOUT_S) -> bool:
+    r"""
+    \brief One TCP handshake to `host:port` with a hard deadline.
+
+    \details Completing a handshake is the weakest claim that actually matters
+    to an application: it proves the path carries stateful traffic both ways,
+    which ICMP does not. No payload is sent and the socket is closed at once,
+    so this costs one round trip and leaves nothing behind.
+
+    \param host       IP or hostname. Prefer an IP: DNS is itself a casualty of
+                      the outages this probe exists to find, and a resolver
+                      timeout would be misread as a transport failure.
+    \param port       TCP port (443 for the defaults).
+    \param timeout_s  Connect deadline, in seconds.
+    \return True if the handshake completed within the deadline.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        # Refused, unreachable, timed out, DNS failure -- all mean the same
+        # thing here: this target did not answer. The caller decides whether
+        # one silent target constitutes an outage.
+        return False
+
+
+def tcp_plane_ok(
+    targets: list[tuple[str, int]],
+    timeout_s: int = DEFAULT_TCP_CHECK_TIMEOUT_S,
+) -> bool:
+    r"""
+    \brief Whether ANY configured TCP target completes a handshake.
+
+    \details Any, not all, and the distinction is the whole design. This
+    function gates the recovery ladder, and that ladder reboots the router; a
+    probe that trips because one provider is having a bad afternoon would
+    reboot a perfectly healthy connection. Requiring every target to be silent
+    before declaring the transport dead makes a false positive need three
+    unrelated operators to fail at once.
+
+    \details Partial failures are still logged, because they are the early
+    warning: "two of three targets refused" is the signature of a degrading
+    link and is exactly what a ping-only probe cannot see.
+
+    \param targets    Parsed (host, port) pairs. Empty disables the check.
+    \param timeout_s  Per-connect deadline, in seconds.
+    \return True if at least one target answered, or if no targets are set.
+    """
+    if not targets:
+        return True
+
+    failed = [f"{h}:{p}" for h, p in targets if not tcp_ok(h, p, timeout_s)]
+    if not failed:
+        return True
+
+    if len(failed) == len(targets):
+        _emit(logging.WARNING, TAG_DETECT,
+              "TCP plane down: no handshake completed to any of %s "
+              "(ICMP may still be passing -- small packets are not the signal)",
+              ", ".join(failed))
+        return False
+
+    _emit(logging.WARNING, TAG_DETECT,
+          "TCP plane degraded: %d/%d targets refused (%s) -- link is not healthy "
+          "but at least one path is open, so not treating this as an outage",
+          len(failed), len(targets), ", ".join(failed))
+    return True
+
+
+def wan_up(
+    ping_target: str,
+    tcp_targets: list[tuple[str, int]],
+    tcp_timeout_s: int = DEFAULT_TCP_CHECK_TIMEOUT_S,
+) -> bool:
+    r"""
+    \brief The WAN-liveness signal: ICMP reachability AND a usable TCP plane.
+
+    \details Both planes must answer. ICMP alone was the original signal and it
+    has a blind spot that this watchdog was observed sitting inside: echoes to
+    an anycast address kept returning perfectly while no HTTPS connection to
+    the wider internet would complete, so the ladder logged nothing and took no
+    action through an outage that made the link useless to every device behind
+    it.
+
+    \details ICMP is checked first and short-circuits, so the common healthy
+    case costs one ping and the TCP probes only run when they can change the
+    answer.
+
+    \param ping_target    IP to ping.
+    \param tcp_targets    Parsed (host, port) pairs; empty skips the TCP half.
+    \param tcp_timeout_s  Per-connect deadline, in seconds.
+    \return True if both planes are usable.
+    """
+    if not icmp_ok(ping_target):
+        return False
+    return tcp_plane_ok(tcp_targets, tcp_timeout_s)
 
 
 # --- circuit breaker (shared, one instance per rung) -------------------------
@@ -553,12 +718,15 @@ class ZteRouterApi:
         *,
         session: Optional[requests.Session] = None,
         http_timeout_s: int = 8,
+        session_max_age_s: float = DEFAULT_SESSION_MAX_AGE_S,
     ) -> None:
         r"""
         \param router_ip      Admin IP of the router (e.g. 192.168.0.1).
         \param password        Plain admin password (hashed before sending).
         \param session         Injectable requests.Session (tests pass a mock).
         \param http_timeout_s  Per-request timeout, in seconds.
+        \param session_max_age_s  How long a cached login is trusted before
+               ensure_login() re-authenticates unprompted.
         """
         self._ip = router_ip
         self._password = password
@@ -575,6 +743,8 @@ class ZteRouterApi:
             }
         )
         self._logged_in = False
+        self._session_max_age_s = session_max_age_s
+        self._logged_in_at = 0.0
 
     def _get(self, cmd: str) -> Optional[dict]:
         r"""
@@ -704,6 +874,7 @@ class ZteRouterApi:
             return False
         if result in _OK_RESULTS:
             self._logged_in = True
+            self._logged_in_at = time.monotonic()
             _emit(logging.INFO, TAG_ACTION, "router login succeeded (result=%s)", result)
             return True
         _emit(
@@ -714,9 +885,27 @@ class ZteRouterApi:
         return False
 
     def ensure_login(self) -> bool:
-        r"""\brief Log in only if not already authenticated. \return True if usable."""
+        r"""
+        \brief Log in if not authenticated, or if the cached session is stale.
+
+        \details The cached `stok` is only ever invalidated reactively, by a
+        request that has already been rejected (see `_post_set`). After a long
+        healthy stretch that makes the FIRST recovery action of an outage a
+        guaranteed write-off: it is sent on a day-old stok, fails, and still
+        burns a full cooldown before anything else is tried. Re-authenticating
+        when the cached login is older than `session_max_age_s` turns that
+        wasted rung into a working one.
+
+        \return True if usable.
+        """
         if self._logged_in:
-            return True
+            age = time.monotonic() - self._logged_in_at
+            if age < self._session_max_age_s:
+                return True
+            _emit(logging.INFO, TAG_ACTION,
+                  "cached router login is %.0fs old (max %.0fs) -- re-authenticating",
+                  age, self._session_max_age_s)
+            self._logged_in = False
         return self.login()
 
     def is_admin_plane_up(self) -> bool:
@@ -1659,6 +1848,11 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     router_ip = os.environ.get("ROUTER_IP", DEFAULT_ROUTER_IP)
     password = os.environ.get("ROUTER_PASSWORD", "")
     ping_target = os.environ.get("PING_TARGET", DEFAULT_PING_TARGET)
+    tcp_targets = (
+        parse_tcp_targets(os.environ.get("TCP_CHECK_TARGETS", DEFAULT_TCP_CHECK_TARGETS))
+        if _env_int("TCP_CHECK_ENABLED", 1) else []
+    )
+    tcp_timeout_s = _env_int("TCP_CHECK_TIMEOUT", DEFAULT_TCP_CHECK_TIMEOUT_S)
     boot_wait_s = float(_env_int("L3_BOOT_WAIT", DEFAULT_L3_BOOT_WAIT_S))
     l2_settle_s = float(_env_int("L2_SETTLE", DEFAULT_L2_SETTLE_S))
     l2_max = _env_int("L2_MAX_PER_WINDOW", DEFAULT_L2_MAX_PER_WINDOW)
@@ -1668,7 +1862,10 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     if not password:
         _emit(logging.ERROR, TAG_FAULT, "ROUTER_PASSWORD empty -- authentication will fail; set it in config.env")
 
-    api = ZteRouterApi(router_ip, password)
+    api = ZteRouterApi(
+        router_ip, password,
+        session_max_age_s=_env_int("SESSION_MAX_AGE", DEFAULT_SESSION_MAX_AGE_S),
+    )
 
     ladder: List[RecoveryAction] = [
         ConnectRecovery(api),
@@ -1722,9 +1919,17 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
 
     _emit(logging.INFO, TAG_LIFECYCLE, "wired: router=%s ping=%s L2=%s/24h L3=%s/24h boot_wait=%.0fs",
           router_ip, ping_target, l2_max, l3_max, boot_wait_s)
+    if tcp_targets:
+        _emit(logging.INFO, TAG_LIFECYCLE,
+              "TCP plane check: %s (timeout %ss) -- WAN counts as down only when "
+              "ICMP fails or every TCP target refuses",
+              ", ".join(f"{h}:{p}" for h, p in tcp_targets), tcp_timeout_s)
+    else:
+        _emit(logging.WARNING, TAG_LIFECYCLE,
+              "TCP plane check disabled -- ICMP alone cannot see a TCP-level outage")
 
     return WatchdogDeps(
-        is_wan_up=lambda: icmp_ok(ping_target),
+        is_wan_up=lambda: wan_up(ping_target, tcp_targets, tcp_timeout_s),
         is_admin_plane_up=api.is_admin_plane_up,
         is_registered=api.is_registered,
         ladder=ladder,
@@ -1968,6 +2173,42 @@ def test_given_reboot_ok_when_reboot_then_session_invalidated():
     api._logged_in = True
     assert api.reboot_device() is True
     assert api._logged_in is False
+
+
+def test_given_fresh_cached_login_when_ensure_login_then_no_reauth():
+    s = _session()
+    api = ZteRouterApi("192.168.0.1", "pw", session=s, session_max_age_s=300)
+    with patch.object(zte_watchdog.time, "monotonic", return_value=1000.0):
+        api._logged_in = True
+        api._logged_in_at = 900.0  # 100s old, well inside the bound
+        assert api.ensure_login() is True
+    s.post.assert_not_called()
+
+
+def test_given_stale_cached_login_when_ensure_login_then_reauthenticates():
+    # The defect this closes: the cached stok is only dropped reactively, so
+    # the first recovery action after a long healthy stretch was always sent
+    # on a dead session and always thrown away.
+    s = _session()
+    s.get.return_value = _resp({"LD": "ABCDEF"})
+    s.post.return_value = _resp({"result": "0"})
+    api = ZteRouterApi("192.168.0.1", "pw", session=s, session_max_age_s=300)
+    with patch.object(zte_watchdog.time, "monotonic", return_value=100_000.0):
+        api._logged_in = True
+        api._logged_in_at = 1.0  # a day old
+        assert api.ensure_login() is True
+    _, kwargs = s.post.call_args
+    assert kwargs["data"]["goformId"] == "LOGIN"
+
+
+def test_given_successful_login_when_login_then_stamps_age_clock():
+    s = _session()
+    s.get.return_value = _resp({"LD": "ABCDEF"})
+    s.post.return_value = _resp({"result": "0"})
+    api = ZteRouterApi("192.168.0.1", "pw", session=s)
+    with patch.object(zte_watchdog.time, "monotonic", return_value=4242.0):
+        assert api.login() is True
+    assert api._logged_in_at == 4242.0
 
 
 def test_given_connection_error_when_probe_admin_plane_then_false():
@@ -2735,6 +2976,7 @@ _INSTALLER_TO_CONSTANT = {
     "CHECK_INTERVAL": "DEFAULT_CHECK_INTERVAL_S",
     "FAIL_THRESHOLD": "DEFAULT_FAIL_THRESHOLD",
     "COOLDOWN": "DEFAULT_COOLDOWN_S",
+    "SESSION_MAX_AGE": "DEFAULT_SESSION_MAX_AGE_S",
     "L2_SETTLE": "DEFAULT_L2_SETTLE_S",
     "L2_MAX_PER_WINDOW": "DEFAULT_L2_MAX_PER_WINDOW",
     "L3_MAX_PER_WINDOW": "DEFAULT_L3_MAX_PER_WINDOW",
@@ -2747,12 +2989,14 @@ _INSTALLER_TO_CONSTANT = {
     "MTU_FLOOR": "DEFAULT_MTU_FLOOR",
     "MTU_CHECK_EVERY": "DEFAULT_MTU_CHECK_EVERY_S",
     "MTU_MAX_PER_WINDOW": "DEFAULT_MTU_MAX_PER_WINDOW",
+    "TCP_CHECK_TIMEOUT": "DEFAULT_TCP_CHECK_TIMEOUT_S",
 }
 
 _INSTALLER_TO_CONSTANT_STR = {
     "ROUTER_IP": "DEFAULT_ROUTER_IP",
     "PING_TARGET": "DEFAULT_PING_TARGET",
     "LOG_LEVEL": "DEFAULT_LOG_LEVEL",
+    "TCP_CHECK_TARGETS": "DEFAULT_TCP_CHECK_TARGETS",
 }
 
 _SHELL_DEFAULT_RE = re.compile(
@@ -2856,6 +3100,81 @@ def test_given_every_mtu_env_knob_when_mapped_then_the_table_is_complete():
     assert covered == {"MTU_TARGET", "MTU_FLOOR", "MTU_CHECK_EVERY", "MTU_MAX_PER_WINDOW"}
 
 
+
+
+# --- transport-plane check ---------------------------------------------------
+#
+# WHY these exist: the watchdog was observed sitting inside an outage it could
+# not see. ICMP echoes to an anycast address kept returning perfectly while no
+# HTTPS handshake to the wider internet would complete, so the ladder logged
+# nothing and took no action through a period the link was useless to every
+# device behind it. These tests pin the two halves of the fix: that a dead TCP
+# plane is now detected, and -- just as important -- that a single unhappy
+# provider is not mistaken for one, because the ladder reboots the router.
+
+
+def test_given_host_port_list_when_parsed_then_returns_pairs():
+    assert zte_watchdog.parse_tcp_targets("1.1.1.1:443,8.8.8.8:53") == [
+        ("1.1.1.1", 443), ("8.8.8.8", 53)]
+
+
+def test_given_blank_and_malformed_entries_when_parsed_then_skipped():
+    # A typo in one target must not stop the watchdog starting: running with two
+    # probes beats refusing to run at all.
+    assert zte_watchdog.parse_tcp_targets("1.1.1.1:443, ,nonsense,:443,h:x") == [
+        ("1.1.1.1", 443)]
+
+
+def test_given_no_targets_when_plane_checked_then_treated_as_up(monkeypatch):
+    # Empty list means the operator disabled the check; it must not read as an
+    # outage and start rebooting the router.
+    monkeypatch.setattr(zte_watchdog, "tcp_ok", lambda *a, **k: False)
+    assert zte_watchdog.tcp_plane_ok([]) is True
+
+
+def test_given_every_target_refusing_when_plane_checked_then_down(monkeypatch):
+    monkeypatch.setattr(zte_watchdog, "tcp_ok", lambda *a, **k: False)
+    assert zte_watchdog.tcp_plane_ok([("a", 443), ("b", 443)]) is False
+
+
+def test_given_one_target_answering_when_plane_checked_then_up(monkeypatch):
+    # The false-positive guard: two of three operators down is a degraded link,
+    # not a dead one, and must not trip the recovery ladder.
+    monkeypatch.setattr(zte_watchdog, "tcp_ok",
+                        lambda host, *a, **k: host == "good")
+    assert zte_watchdog.tcp_plane_ok(
+        [("bad1", 443), ("good", 443), ("bad2", 443)]) is True
+
+
+def test_given_icmp_failing_when_wan_up_then_false_without_tcp_probes(monkeypatch):
+    # ICMP short-circuits: the TCP probes cost real seconds and cannot change
+    # the answer once ping is already down.
+    probed = []
+    monkeypatch.setattr(zte_watchdog, "icmp_ok", lambda *a, **k: False)
+    monkeypatch.setattr(zte_watchdog, "tcp_ok",
+                        lambda *a, **k: probed.append(a) or True)
+    assert zte_watchdog.wan_up("1.1.1.1", [("a", 443)]) is False
+    assert probed == []
+
+
+def test_given_icmp_up_but_tcp_plane_dead_when_wan_up_then_false(monkeypatch):
+    # The exact blind spot: ping perfect, nothing else works.
+    monkeypatch.setattr(zte_watchdog, "icmp_ok", lambda *a, **k: True)
+    monkeypatch.setattr(zte_watchdog, "tcp_ok", lambda *a, **k: False)
+    assert zte_watchdog.wan_up("1.1.1.1", [("a", 443), ("b", 443)]) is False
+
+
+def test_given_both_planes_up_when_wan_up_then_true(monkeypatch):
+    monkeypatch.setattr(zte_watchdog, "icmp_ok", lambda *a, **k: True)
+    monkeypatch.setattr(zte_watchdog, "tcp_ok", lambda *a, **k: True)
+    assert zte_watchdog.wan_up("1.1.1.1", [("a", 443)]) is True
+
+
+def test_given_refused_connection_when_tcp_ok_then_false(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(zte_watchdog.socket, "create_connection", boom)
+    assert zte_watchdog.tcp_ok("1.1.1.1", 443) is False
 PYTESTEOF
 
 echo "[5/7] Writing config to ${CONFIG_FILE} (mode 600)..."
@@ -2874,6 +3193,7 @@ PING_TARGET=${PING_TARGET}
 CHECK_INTERVAL=${CHECK_INTERVAL}
 FAIL_THRESHOLD=${FAIL_THRESHOLD}
 COOLDOWN=${COOLDOWN}
+SESSION_MAX_AGE=${SESSION_MAX_AGE}
 L2_MAX_PER_WINDOW=${L2_MAX_PER_WINDOW}
 L2_SETTLE=${L2_SETTLE}
 L3_MAX_PER_WINDOW=${L3_MAX_PER_WINDOW}
@@ -2889,6 +3209,9 @@ MTU_TARGET=${MTU_TARGET}
 MTU_FLOOR=${MTU_FLOOR}
 MTU_CHECK_EVERY=${MTU_CHECK_EVERY}
 MTU_MAX_PER_WINDOW=${MTU_MAX_PER_WINDOW}
+TCP_CHECK_ENABLED=${TCP_CHECK_ENABLED}
+TCP_CHECK_TARGETS=${TCP_CHECK_TARGETS}
+TCP_CHECK_TIMEOUT=${TCP_CHECK_TIMEOUT}
 EOF
 chmod 600 "${CONFIG_FILE}"
 
