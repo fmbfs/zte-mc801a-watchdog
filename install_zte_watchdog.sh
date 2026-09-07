@@ -1855,6 +1855,7 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     tcp_timeout_s = _env_int("TCP_CHECK_TIMEOUT", DEFAULT_TCP_CHECK_TIMEOUT_S)
     boot_wait_s = float(_env_int("L3_BOOT_WAIT", DEFAULT_L3_BOOT_WAIT_S))
     l2_settle_s = float(_env_int("L2_SETTLE", DEFAULT_L2_SETTLE_S))
+    session_max_age_s = float(_env_int("SESSION_MAX_AGE", DEFAULT_SESSION_MAX_AGE_S))
     l2_max = _env_int("L2_MAX_PER_WINDOW", DEFAULT_L2_MAX_PER_WINDOW)
     l3_max = _env_int("L3_MAX_PER_WINDOW", DEFAULT_L3_MAX_PER_WINDOW)
     window_s = _env_int("ROLLING_WINDOW_SECONDS", DEFAULT_ROLLING_WINDOW_S)
@@ -1862,10 +1863,7 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     if not password:
         _emit(logging.ERROR, TAG_FAULT, "ROUTER_PASSWORD empty -- authentication will fail; set it in config.env")
 
-    api = ZteRouterApi(
-        router_ip, password,
-        session_max_age_s=_env_int("SESSION_MAX_AGE", DEFAULT_SESSION_MAX_AGE_S),
-    )
+    api = ZteRouterApi(router_ip, password, session_max_age_s=session_max_age_s)
 
     ladder: List[RecoveryAction] = [
         ConnectRecovery(api),
@@ -1917,8 +1915,11 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     else:
         _emit(logging.INFO, TAG_LIFECYCLE, "MTU guard disabled (MTU_GUARD_ENABLED=0)")
 
-    _emit(logging.INFO, TAG_LIFECYCLE, "wired: router=%s ping=%s L2=%s/24h L3=%s/24h boot_wait=%.0fs",
-          router_ip, ping_target, l2_max, l3_max, boot_wait_s)
+    _emit(logging.INFO, TAG_LIFECYCLE,
+          "wired: router=%s ping=%s L2=%s/24h L3=%s/24h boot_wait=%.0fs "
+          "l2_settle=%.0fs session_max_age=%.0fs",
+          router_ip, ping_target, l2_max, l3_max, boot_wait_s,
+          l2_settle_s, session_max_age_s)
     if tcp_targets:
         _emit(logging.INFO, TAG_LIFECYCLE,
               "TCP plane check: %s (timeout %ss) -- WAN counts as down only when "
