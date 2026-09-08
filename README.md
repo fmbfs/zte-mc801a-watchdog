@@ -78,7 +78,7 @@ Two different faults look identical from outside — "no internet" — but need 
 - **Wedged data session**: the modem is registered on the carrier, `ppp_connected`, but there is no route. There *is* a session to re-dial, so **L2 is the correct, cheap fix**.
 - **No registration** ("Limited Service" / not attached): there is no session to re-dial, so every L2 attempt is guaranteed to fail. **Only L3 has ever recovered this.**
 
-Before running the ladder, the daemon reads `modem_main_state`, `network_type` and `signalbar` and jumps straight to L3 when the modem holds no usable registration. Without the gate the second case still reaches L3 eventually — but only after `L3_ESCALATION_THRESHOLD` failed L2 attempts a cooldown apart, roughly ten minutes of useless `DISCONNECT`/`CONNECT` calls, each burning L2 breaker budget that a real session fault might need later.
+Before running the ladder, the daemon reads `modem_main_state`, `network_type` and `signalbar` and jumps straight to L3 when the modem holds no usable registration. Without the gate the second case still reaches L3 eventually — but only after `L3_ESCALATION_THRESHOLD` failed L2 attempts a cooldown apart, several minutes of useless `DISCONNECT`/`CONNECT` calls, each burning L2 breaker budget that a real session fault might need later.
 
 An unreadable router returns "unknown", never a guess: that is the liveness gate's problem, not this probe's.
 
@@ -224,11 +224,12 @@ All settings are environment variables, stored in `/opt/zte-watchdog/config.env`
 | `PING_TARGET` | `1.1.1.1` | Address used to detect connectivity |
 | `CHECK_INTERVAL` | `20` | Seconds between checks |
 | `FAIL_THRESHOLD` | `3` | Consecutive failures before acting |
-| `COOLDOWN` | `180` | Seconds between recovery attempts |
+| `COOLDOWN` | `180` | Seconds between recovery attempts, measured from when the previous attempt *finished*. L3 blocks for the whole boot wait, so this is time after the router is back (or the readiness ceiling gave up), not time since the reboot was issued. |
+| `SESSION_MAX_AGE` | `300` | Seconds a cached router login is trusted before re-authenticating |
 | `L2_MAX_PER_WINDOW` | `8` | L2 breaker cap per window |
-| `L2_SETTLE` | `3` | Seconds between `DISCONNECT` and `CONNECT` |
+| `L2_SETTLE` | `15` | Seconds between `DISCONNECT` and `CONNECT` |
 | `L3_MAX_PER_WINDOW` | `3` | L3 (reboot) breaker cap per window |
-| `L3_ESCALATION_THRESHOLD` | `3` | Failed L2 attempts before escalating to L3 |
+| `L3_ESCALATION_THRESHOLD` | `2` | Failed L2 attempts before escalating to L3 |
 | `L3_BOOT_WAIT` | `90` | Seconds to wait out a reboot |
 | `ROUTER_DEAD_THRESHOLD` | `3` | Cycles of unreachable admin plane before `CRITICAL` |
 | `ADMIN_DEAD_RETRY_EVERY` | `10` | Cycles between blind ladder retries while admin is dead |
@@ -240,6 +241,9 @@ All settings are environment variables, stored in `/opt/zte-watchdog/config.env`
 | `MTU_FLOOR` | `1200` | Hard floor; never write below this |
 | `MTU_CHECK_EVERY` | `900` | Seconds between MTU checks |
 | `MTU_MAX_PER_WINDOW` | `4` | MTU-correction breaker cap per window |
+| `TCP_CHECK_ENABLED` | `1` | Also require a TCP handshake, not just ICMP |
+| `TCP_CHECK_TARGETS` | `1.1.1.1:443,8.8.8.8:443,9.9.9.9:443` | `host:port` list; WAN is down only if *every* target refuses |
+| `TCP_CHECK_TIMEOUT` | `4` | Per-target connect timeout, in seconds |
 
 ---
 
