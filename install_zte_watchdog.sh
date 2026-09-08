@@ -1655,6 +1655,8 @@ class WatchdogDeps:
     \var on_admin_plane_dead  (now) -> None  fired when the router is wedged.
     \var is_registered        () -> Optional[bool] carrier-registration signal.
     \var mtu_guard            optional MtuGuard; None disables the check.
+    \var clock                () -> float wall clock, injectable so tests can
+                              simulate an action that blocks for minutes.
     """
 
     is_wan_up: Callable[[], bool]
@@ -1666,6 +1668,10 @@ class WatchdogDeps:
     on_admin_plane_dead: Callable[[float], None]
     #: Optional path-MTU guard, consulted on the HAPPY path (see step()).
     mtu_guard: Optional["MtuGuard"] = None
+    #: Wall clock, read either side of a rung's attempt() to learn how long it
+    #: actually blocked. Injectable so the cooldown accounting is testable
+    #: without really sleeping out a boot wait.
+    clock: Callable[[], float] = time.time
 
 
 # --- pure per-cycle decision -------------------------------------------------
@@ -1811,8 +1817,18 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
     action = deps.ladder[chosen_idx]
 
     _emit(logging.WARNING, TAG_ACTION, "ceiling L%s SWITCHING TO %s", s.escalation_level, action.name)
+    # attempt() BLOCKS. L3 sleeps out the entire boot wait -- the L3_BOOT_WAIT
+    # floor plus the readiness ceiling, ~205s -- before it returns. Stamping the
+    # cooldown with `now`, captured before that block, let the boot wait consume
+    # the whole cooldown, so the very next poll walked straight through the
+    # cooldown gate and fired a second REBOOT_DEVICE into a router that was
+    # still coming up. Observed 2026-09-08: reboot at 08:50:48, boot wait gave
+    # up at 08:54:25, second reboot at 08:54:27 -- and the router came back with
+    # its WiFi radio off, needing a hand on the physical button. The cooldown
+    # has to start when the action finishes, not when it was issued.
+    started = deps.clock()
     issued = action.attempt(now)
-    s.last_action_time = now
+    s.last_action_time = now + max(0.0, deps.clock() - started)
     if issued:
         _emit(logging.INFO, TAG_ACTION, "%s completed SWITCHING TO awaiting effect", action.name)
     else:
@@ -2001,7 +2017,8 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -2384,7 +2401,8 @@ def _cfg(**over):
     return WatchdogConfig(**base)
 
 
-def _deps(wan_up, admin_up, dead_calls, avail=(True, True, True), registered=True):
+def _deps(wan_up, admin_up, dead_calls, avail=(True, True, True), registered=True,
+          clock=None, ladder=None):
     r"""
     \brief Build injected deps for step() tests.
 
@@ -2392,18 +2410,70 @@ def _deps(wan_up, admin_up, dead_calls, avail=(True, True, True), registered=Tru
                        False (Limited Service), or None (unreadable).
                        Defaults to True so tests written before the
                        registration gate keep exercising the normal ladder.
+    \param clock       Optional () -> float wall clock. Omitted leaves the
+                       production default, under which the fake rungs return
+                       instantly and the cooldown stamp stays ~= now.
+    \param ladder      Optional [L1, L2, L3] override, for rungs that need to
+                       do something on attempt() beyond recording the call.
     """
-    l1 = FakeAction("L1", is_available=avail[0])
-    l2 = FakeAction("L2", is_available=avail[1])
-    l3 = FakeAction("L3", is_available=avail[2])
+    l1, l2, l3 = ladder if ladder is not None else (
+        FakeAction("L1", is_available=avail[0]),
+        FakeAction("L2", is_available=avail[1]),
+        FakeAction("L3", is_available=avail[2]),
+    )
+    extra = {} if clock is None else {"clock": clock}
     deps = WatchdogDeps(
         is_wan_up=lambda: wan_up,
         is_admin_plane_up=lambda: admin_up,
         is_registered=lambda: registered,
         ladder=[l1, l2, l3],
         on_admin_plane_dead=lambda now: dead_calls.append(now),
+        **extra,
     )
     return deps, (l1, l2, l3)
+
+
+class _FakeClock:
+    r"""
+    \brief A hand-wound wall clock.
+
+    \details step() reads it either side of a rung's attempt() to learn how
+    long that rung actually blocked, so a test can simulate an L3 boot wait
+    without sleeping through one.
+    """
+
+    def __init__(self, start=0.0):
+        self.t = start
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
+@dataclass
+class BlockingAction:
+    r"""
+    \brief A rung whose attempt() burns wall-clock time, like L3's boot wait.
+
+    \var blocks_for  Seconds the fake clock is wound forward inside attempt().
+    """
+
+    name: str
+    clock: _FakeClock
+    blocks_for: float
+    result: bool = True
+    is_available: bool = True
+    calls: List[float] = field(default_factory=list)
+
+    def available(self, now: float) -> bool:
+        return self.is_available
+
+    def attempt(self, now: float) -> bool:
+        self.calls.append(now)
+        self.clock.advance(self.blocks_for)
+        return self.result
 
 
 def test_given_wan_up_when_step_then_ladder_resets_to_level_1():
@@ -2567,6 +2637,80 @@ def test_given_inside_cooldown_when_step_then_no_action():
     out = step(WatchdogState(consecutive_failures=3, escalation_level=2, last_action_time=950.0),
                deps, _cfg(cooldown_s=180), 1000.0)
     assert not (l1.calls or l2.calls or l3.calls)
+
+
+# ---------------------------------------------------------------------------
+# Cooldown accounting across a BLOCKING rung.
+#
+# attempt() is not instantaneous: L3 sleeps out the L3_BOOT_WAIT floor and then
+# polls up to the readiness ceiling, ~205s in the shipped config, before it
+# returns. The cooldown stamp therefore has to be taken when the rung FINISHES.
+# Stamping it with the pre-attempt `now` let the boot wait consume the whole
+# cooldown, and the next poll rebooted a router that was still booting.
+# ---------------------------------------------------------------------------
+
+
+def test_given_blocking_action_when_step_then_cooldown_starts_when_it_returns():
+    clock = _FakeClock(50_000.0)
+    l3 = BlockingAction("L3", clock, blocks_for=220.0)
+    deps, _ = _deps(False, True, [], clock=clock,
+                    ladder=(FakeAction("L1"), FakeAction("L2"), l3))
+    out = step(WatchdogState(consecutive_failures=3, escalation_level=3, last_action_time=0.0),
+               deps, _cfg(cooldown_s=180), 1000.0)
+    assert l3.calls == [1000.0]
+    # 1000 (issued) + 220 (blocked in the boot wait), not 1000.
+    assert out.last_action_time == pytest.approx(1220.0)
+
+
+def test_given_instant_action_when_step_then_cooldown_starts_at_now():
+    clock = _FakeClock(50_000.0)
+    l2 = BlockingAction("L2", clock, blocks_for=0.0)
+    deps, _ = _deps(False, True, [], clock=clock,
+                    ladder=(FakeAction("L1"), l2, FakeAction("L3")))
+    out = step(WatchdogState(consecutive_failures=3, escalation_level=2, last_action_time=0.0),
+               deps, _cfg(cooldown_s=180), 1000.0)
+    assert out.last_action_time == pytest.approx(1000.0)
+
+
+def test_given_boot_wait_outlasts_cooldown_when_next_step_then_no_second_reboot():
+    r"""
+    \brief The 2026-09-08 double reboot, as a test.
+
+    \details Live sequence: REBOOT_DEVICE at 08:50:48, the boot wait gave up at
+    08:54:25 having burned 217s against a 180s cooldown, and the next poll two
+    seconds later issued a second REBOOT_DEVICE into a router that was still
+    coming up. It came back with its WiFi radio off. One boot wait must not
+    unlock the next reboot.
+    """
+    clock = _FakeClock(50_000.0)
+    l3 = BlockingAction("L3", clock, blocks_for=217.0)
+    deps, _ = _deps(False, True, [], clock=clock,
+                    ladder=(FakeAction("L1"), FakeAction("L2"), l3))
+    cfg = _cfg(cooldown_s=180)
+
+    state = step(WatchdogState(consecutive_failures=3, escalation_level=3, last_action_time=0.0),
+                 deps, cfg, 1000.0)
+    assert len(l3.calls) == 1
+
+    # The next poll lands 2s after the boot wait returned -- as it did live.
+    step(replace(state, consecutive_failures=4), deps, cfg, 1219.0)
+    assert len(l3.calls) == 1, "second REBOOT_DEVICE issued while the router was still booting"
+
+
+def test_given_clock_steps_backwards_when_step_then_cooldown_is_not_shortened():
+    r"""\brief An NTP correction mid-attempt must not credit negative time."""
+    clock = _FakeClock(50_000.0)
+    l3 = BlockingAction("L3", clock, blocks_for=-30.0)
+    deps, _ = _deps(False, True, [], clock=clock,
+                    ladder=(FakeAction("L1"), FakeAction("L2"), l3))
+    out = step(WatchdogState(consecutive_failures=3, escalation_level=3, last_action_time=0.0),
+               deps, _cfg(cooldown_s=180), 1000.0)
+    assert out.last_action_time == pytest.approx(1000.0)
+
+
+def test_given_no_clock_injected_when_deps_built_then_defaults_to_wall_clock():
+    deps, _ = _deps(False, True, [])
+    assert deps.clock is time.time
 
 # =============================================================================
 # MTU guard

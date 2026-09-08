@@ -224,7 +224,7 @@ All settings are environment variables, stored in `/opt/zte-watchdog/config.env`
 | `PING_TARGET` | `1.1.1.1` | Address used to detect connectivity |
 | `CHECK_INTERVAL` | `20` | Seconds between checks |
 | `FAIL_THRESHOLD` | `3` | Consecutive failures before acting |
-| `COOLDOWN` | `180` | Seconds between recovery attempts |
+| `COOLDOWN` | `180` | Seconds between recovery attempts, measured from when the previous attempt *finished*. L3 blocks for the whole boot wait, so this is time after the router is back (or the readiness ceiling gave up), not time since the reboot was issued. |
 | `SESSION_MAX_AGE` | `300` | Seconds a cached router login is trusted before re-authenticating |
 | `L2_MAX_PER_WINDOW` | `8` | L2 breaker cap per window |
 | `L2_SETTLE` | `15` | Seconds between `DISCONNECT` and `CONNECT` |
