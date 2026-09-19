@@ -1974,9 +1974,9 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
 
     _emit(logging.INFO, TAG_LIFECYCLE,
           "wired: router=%s ping=%s L2=%s/24h L3=%s/24h boot_wait=%.0fs "
-          "l2_settle=%.0fs session_max_age=%.0fs",
+          "readiness_ceiling=%.0fs l2_settle=%.0fs session_max_age=%.0fs",
           router_ip, ping_target, l2_max, l3_max, boot_wait_s,
-          l2_settle_s, session_max_age_s)
+          readiness_ceiling_s, l2_settle_s, session_max_age_s)
     if tcp_targets:
         _emit(logging.INFO, TAG_LIFECYCLE,
               "TCP plane check: %s (timeout %ss) -- WAN counts as down only when "
