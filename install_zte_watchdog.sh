@@ -68,7 +68,11 @@ L3_MAX_PER_WINDOW="${L3_MAX_PER_WINDOW:-3}"
 # the first reboot is 12 minutes into an outage -- long enough that a human
 # beats it to the router.
 L3_ESCALATION_THRESHOLD="${L3_ESCALATION_THRESHOLD:-2}"
-L3_BOOT_WAIT="${L3_BOOT_WAIT:-90}"
+# Measured on the MC801A: a reboot that comes back confirms readiness at ~120s,
+# so a 90s floor starts probing while the router is still down. The ceiling has
+# to clear the floor by enough that "unconfirmed" means wedged, not impatient.
+L3_BOOT_WAIT="${L3_BOOT_WAIT:-150}"
+L3_READINESS_CEILING="${L3_READINESS_CEILING:-300}"
 ROUTER_DEAD_THRESHOLD="${ROUTER_DEAD_THRESHOLD:-3}"
 ADMIN_DEAD_RETRY_EVERY="${ADMIN_DEAD_RETRY_EVERY:-10}"
 ROLLING_WINDOW_SECONDS="${ROLLING_WINDOW_SECONDS:-86400}"
@@ -380,8 +384,17 @@ DEFAULT_L3_ESCALATION_THRESHOLD = 2
 DEFAULT_ROUTER_DEAD_THRESHOLD = 3
 #: Cycles between blind ladder retries while the admin plane is dead.
 DEFAULT_ADMIN_DEAD_RETRY_EVERY = 10
-#: Seconds to wait out a soft reboot before probing for readiness.
-DEFAULT_L3_BOOT_WAIT_S = 90
+#: Seconds to wait out a soft reboot before probing for readiness. Measured on
+#: this MC801A: a reboot that does come back confirms readiness at ~120s
+#: (2026-09-19 20:34:38 -> 20:36:50). A 90s floor therefore starts probing while
+#: the router is still down and burns the ceiling on a boot that is proceeding
+#: normally.
+DEFAULT_L3_BOOT_WAIT_S = 150
+#: Hard cap on the total post-reboot wait. Must clear the floor by enough to
+#: absorb a slow boot; at 180 against a 150s floor there is only one probe
+#: window, and an unconfirmed reboot is far more likely to mean "not waited long
+#: enough" than "router is wedged".
+DEFAULT_L3_READINESS_CEILING_S = 300
 #: Seconds between DISCONNECT and CONNECT in an L2 cycle. 3s appears to be too
 #: short for the modem to actually drop the bearer; a hand-driven toggle that
 #: works has a human-length pause in it.
@@ -1112,8 +1125,11 @@ class RecoveryAction(Protocol):
         \brief Perform one recovery attempt.
 
         \param now  Current epoch time, in seconds.
-        \return True if the command(s) were issued. "Issued" != "connectivity
-                confirmed"; the poll loop confirms restoration next cycle.
+        \return True if the rung did what it claims to do. Still not a claim
+                about connectivity -- the poll loop confirms restoration next
+                cycle -- but a rung that can tell it failed (L3 waiting out a
+                boot that never lands) must return False rather than let the
+                ladder record a success it did not achieve.
         """
         ...
 
@@ -1211,9 +1227,9 @@ class SoftRebootRecovery:
         api: ZteRouterApi,
         breaker: CircuitBreaker,
         *,
-        boot_wait_s: float = 90.0,
+        boot_wait_s: float = float(DEFAULT_L3_BOOT_WAIT_S),
         readiness_probe: Optional[Callable[[], bool]] = None,
-        readiness_ceiling_s: float = 180.0,
+        readiness_ceiling_s: float = float(DEFAULT_L3_READINESS_CEILING_S),
         readiness_poll_s: float = 5.0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -1239,19 +1255,29 @@ class SoftRebootRecovery:
         r"""\brief Whether the L3 breaker still has budget. \return breaker.allow(now)."""
         return self._breaker.allow(now)
 
-    def _wait_for_boot(self) -> None:
-        r"""\brief Sleep the floor, then poll readiness up to the ceiling."""
+    def _wait_for_boot(self) -> bool:
+        r"""
+        \brief Sleep the floor, then poll readiness up to the ceiling.
+
+        \details The return value is the whole point: a reboot whose readiness
+        probe never answered has NOT completed, and saying otherwise is how a
+        wedged router gets rebooted again instead of escalated to a human.
+
+        \return True if readiness was confirmed (or cannot be checked, when no
+                probe is configured -- absence of evidence is not disconfirming).
+        """
         self._sleep(self._boot_wait_s)
         if self._probe is None:
-            return
+            return True
         waited = self._boot_wait_s
         while waited < self._ceiling_s:
             if self._probe():
                 _emit(logging.INFO, TAG_STATE, "router readiness confirmed after ~%.0fs SWITCHING TO normal polling", waited)
-                return
+                return True
             self._sleep(self._poll_s)
             waited += self._poll_s
         _emit(logging.WARNING, TAG_DETECT, "readiness ceiling (%.0fs) reached, router still not confirmed up", self._ceiling_s)
+        return False
 
     def attempt(self, now: float) -> bool:
         r"""
@@ -1268,10 +1294,23 @@ class SoftRebootRecovery:
             return False
         issued = self._api.ensure_login() and self._api.reboot_device()
         self._breaker.record(now)  # an attempt counts, success or not
-        if issued:
-            _emit(logging.WARNING, TAG_ACTION, "REBOOT_DEVICE issued SWITCHING TO boot wait")
-            self._wait_for_boot()
-        return issued
+        if not issued:
+            return False
+        _emit(logging.WARNING, TAG_ACTION, "REBOOT_DEVICE issued SWITCHING TO boot wait")
+        if self._wait_for_boot():
+            return True
+        # The command was accepted but the router never came back within the
+        # ceiling. Reporting that as a completed action is what let the ladder
+        # log "completed SWITCHING TO awaiting effect" over a reboot that
+        # demonstrably had not happened, and then fire a second REBOOT_DEVICE
+        # one cooldown later. Observed 2026-09-19: L1, L2, L2, L3, L3 all
+        # reported clean and none of them restored the link -- it came back
+        # only when the router was power-cycled by hand.
+        _emit(logging.ERROR, TAG_FAULT,
+              "REBOOT_DEVICE was accepted but the router never confirmed readiness -- "
+              "treating this rung as FAILED, not completed; another blind reboot "
+              "will not help a router in this state")
+        return False
 
 
 # --- state / config / deps ---------------------------------------------------
@@ -1870,6 +1909,7 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
     )
     tcp_timeout_s = _env_int("TCP_CHECK_TIMEOUT", DEFAULT_TCP_CHECK_TIMEOUT_S)
     boot_wait_s = float(_env_int("L3_BOOT_WAIT", DEFAULT_L3_BOOT_WAIT_S))
+    readiness_ceiling_s = float(_env_int("L3_READINESS_CEILING", DEFAULT_L3_READINESS_CEILING_S))
     l2_settle_s = float(_env_int("L2_SETTLE", DEFAULT_L2_SETTLE_S))
     session_max_age_s = float(_env_int("SESSION_MAX_AGE", DEFAULT_SESSION_MAX_AGE_S))
     l2_max = _env_int("L2_MAX_PER_WINDOW", DEFAULT_L2_MAX_PER_WINDOW)
@@ -1888,6 +1928,7 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
             api,
             CircuitBreaker(l3_max, window_s, "L3"),
             boot_wait_s=boot_wait_s,
+            readiness_ceiling_s=readiness_ceiling_s,
             readiness_probe=lambda: api.is_admin_plane_up() and icmp_ok(ping_target),
         ),
     ]
@@ -2031,6 +2072,8 @@ from zte_watchdog import (
     CircuitBreaker,
     DisconnectReconnectRecovery,
     SoftRebootRecovery,
+    DEFAULT_L3_BOOT_WAIT_S,
+    DEFAULT_L3_READINESS_CEILING_S,
     WatchdogConfig,
     WatchdogDeps,
     WatchdogState,
@@ -2371,6 +2414,66 @@ def test_given_l3_ok_when_attempt_then_reboot_then_boot_wait_floor():
     assert l3.attempt(1000.0) is True
     api.reboot_device.assert_called_once()
     assert calls and calls[0] == 1.0  # floor slept before probing
+
+
+# ---------------------------------------------------------------------------
+# THE 2026-09-19 FALSE SUCCESS
+#
+# Live sequence: L1 CONNECT, two L2 DISCONNECT/CONNECT cycles and two L3
+# REBOOT_DEVICEs all reported clean, and the link came back only when the
+# router was power-cycled by hand. The first L3 logged "readiness ceiling
+# (180s) reached, router still not confirmed up" and was then logged as
+# "L3:REBOOT_DEVICE completed SWITCHING TO awaiting effect" -- attempt()
+# returned the result of ISSUING the command and threw away the fact that the
+# router never came back. A rung that knows it failed must say so.
+# ---------------------------------------------------------------------------
+
+
+def test_given_reboot_issued_but_readiness_never_confirmed_when_attempt_then_false():
+    r"""\brief An accepted REBOOT_DEVICE whose router never returns is a failure."""
+    api = _api_all_ok()
+    br = CircuitBreaker(3, 86400, "L3")
+    l3 = SoftRebootRecovery(api, br, boot_wait_s=1.0, readiness_ceiling_s=5.0,
+                            readiness_probe=lambda: False, sleep=lambda _s: None)
+    assert l3.attempt(1000.0) is False, "unconfirmed reboot reported as a completed action"
+    api.reboot_device.assert_called_once()
+
+
+def test_given_no_readiness_probe_when_attempt_then_still_true():
+    r"""\brief Absence of a probe is not disconfirming -- keep the old contract."""
+    api = _api_all_ok()
+    br = CircuitBreaker(3, 86400, "L3")
+    l3 = SoftRebootRecovery(api, br, boot_wait_s=0.0, sleep=lambda _s: None)
+    assert l3.attempt(1000.0) is True
+
+
+def test_given_unconfirmed_reboot_when_attempt_then_breaker_still_charged():
+    r"""
+    \brief A failed reboot must still spend L3 budget.
+
+    \details Otherwise a router that never confirms readiness is free to be
+    rebooted forever, and the exhaustion latch that escalates to "physical
+    intervention needed" never fires.
+    """
+    api = _api_all_ok()
+    br = CircuitBreaker(2, 86400, "L3")
+    l3 = SoftRebootRecovery(api, br, boot_wait_s=0.0, readiness_ceiling_s=1.0,
+                            readiness_probe=lambda: False, sleep=lambda _s: None)
+    assert l3.attempt(1000.0) is False
+    assert l3.attempt(1001.0) is False
+    assert l3.available(1002.0) is False, "failed reboots did not charge the L3 breaker"
+
+
+def test_given_boot_wait_floor_clears_observed_boot_time():
+    r"""
+    \brief The shipped floor must not start probing before the router can be up.
+
+    \details Measured 2026-09-19: a reboot that did come back confirmed
+    readiness at ~120s. A floor under that probes a router that is still down.
+    """
+    assert DEFAULT_L3_BOOT_WAIT_S >= 120
+    assert DEFAULT_L3_READINESS_CEILING_S >= DEFAULT_L3_BOOT_WAIT_S + 120, \
+        "ceiling leaves too little room above the floor for a slow boot"
 
 
 # =====================================================================
@@ -3127,6 +3230,7 @@ _INSTALLER_TO_CONSTANT = {
     "L3_MAX_PER_WINDOW": "DEFAULT_L3_MAX_PER_WINDOW",
     "L3_ESCALATION_THRESHOLD": "DEFAULT_L3_ESCALATION_THRESHOLD",
     "L3_BOOT_WAIT": "DEFAULT_L3_BOOT_WAIT_S",
+    "L3_READINESS_CEILING": "DEFAULT_L3_READINESS_CEILING_S",
     "ROUTER_DEAD_THRESHOLD": "DEFAULT_ROUTER_DEAD_THRESHOLD",
     "ADMIN_DEAD_RETRY_EVERY": "DEFAULT_ADMIN_DEAD_RETRY_EVERY",
     "ROLLING_WINDOW_SECONDS": "DEFAULT_ROLLING_WINDOW_S",
@@ -3344,6 +3448,7 @@ L2_SETTLE=${L2_SETTLE}
 L3_MAX_PER_WINDOW=${L3_MAX_PER_WINDOW}
 L3_ESCALATION_THRESHOLD=${L3_ESCALATION_THRESHOLD}
 L3_BOOT_WAIT=${L3_BOOT_WAIT}
+L3_READINESS_CEILING=${L3_READINESS_CEILING}
 ROUTER_DEAD_THRESHOLD=${ROUTER_DEAD_THRESHOLD}
 ADMIN_DEAD_RETRY_EVERY=${ADMIN_DEAD_RETRY_EVERY}
 ROLLING_WINDOW_SECONDS=${ROLLING_WINDOW_SECONDS}
