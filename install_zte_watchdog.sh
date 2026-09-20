@@ -14,7 +14,9 @@
 #   ROUTER_DEAD_THRESHOLD cycles, no goform command can land -> log CRITICAL
 #   once, then retry the ladder blind every ADMIN_DEAD_RETRY_EVERY cycles
 #   (the attach point for a future Shelly power-cycle). Escalation to L3
-#   happens after L3_ESCALATION_THRESHOLD consecutive L2 attempts fail.
+#   happens after L3_ESCALATION_THRESHOLD consecutive L2 attempts fail, or
+#   after REGISTRATION_GATE_STREAK consecutive unregistered readings. An L3
+#   that fails hands the next turn back to L2 rather than to another reboot.
 #
 # Auth (confirmed against MC801A firmware):
 #   LOGIN: SHA256(SHA256(password).upper() + LD).upper(), sets `stok` cookie
@@ -68,6 +70,10 @@ L3_MAX_PER_WINDOW="${L3_MAX_PER_WINDOW:-3}"
 # the first reboot is 12 minutes into an outage -- long enough that a human
 # beats it to the router.
 L3_ESCALATION_THRESHOLD="${L3_ESCALATION_THRESHOLD:-2}"
+# Consecutive unregistered readings before the registration gate jumps straight
+# to L3. Registration flaps: a single NO_SERVICE sample is not worth an
+# eight-minute reboot, so the gate wants to see it sustained.
+REGISTRATION_GATE_STREAK="${REGISTRATION_GATE_STREAK:-3}"
 # Measured on the MC801A: a reboot that comes back confirms readiness at ~120s,
 # so a 90s floor starts probing while the router is still down. The ceiling has
 # to clear the floor by enough that "unconfirmed" means wedged, not impatient.
@@ -216,7 +222,16 @@ If the admin plane is unreachable for ROUTER_DEAD_THRESHOLD cycles, goform
 commands are unlikely to land: fire on_admin_plane_dead
 (log CRITICAL today -- the attach point for a future Shelly power-cycle).
 Escalation to L3 happens after L3_ESCALATION_THRESHOLD consecutive L2 attempts
-fail to restore WAN. Any restoration resets the ladder.
+fail to restore WAN, or after REGISTRATION_GATE_STREAK consecutive unregistered
+readings. Any restoration resets the ladder.
+
+L3 readiness means "the router finished booting" (admin plane answers) and
+nothing more. It deliberately does NOT wait for WAN: WAN is what the reboot is
+trying to restore, so gating on it made every reboot self-report FAILED, pinned
+the ladder at ceiling L3 and re-rebooted a healthy router. An L3 that does fail
+arms a single L2 re-dial before another reboot is considered -- L2 costs ~40s
+against L3's ~8 minutes, and on 2026-09-20 it was the rung that actually
+restored the link.
 
 Everything lives in this one file on purpose (mirrors the original installer's
 single-daemon layout); the OO seams (CircuitBreaker, RecoveryAction Protocol,
@@ -380,6 +395,13 @@ DEFAULT_SESSION_MAX_AGE_S = 300
 #: first reboot lands 12 minutes into an outage -- long enough that a human
 #: beats the ladder to the router.
 DEFAULT_L3_ESCALATION_THRESHOLD = 2
+#: Consecutive unregistered readings before the registration gate jumps the
+#: ceiling to L3. Registration flaps: during the 2026-09-20 outage the modem
+#: read NO_SERVICE for a single 22s window (20:34:44 -> 20:35:06) and was back
+#: on LTE with full bars seconds later, but that one blip was enough to pin the
+#: ladder at ceiling L3 for the next 28 minutes. A reboot is an eight-minute
+#: commitment; it should not be unlocked by one sample.
+DEFAULT_REGISTRATION_GATE_STREAK = 3
 #: Cycles of unreachable admin plane before declaring it dead.
 DEFAULT_ROUTER_DEAD_THRESHOLD = 3
 #: Cycles between blind ladder retries while the admin plane is dead.
@@ -1646,6 +1668,7 @@ class WatchdogConfig:
     fail_threshold: int
     cooldown_s: int
     l3_escalation_threshold: int
+    registration_gate_streak: int
     router_dead_threshold: int
     admin_dead_retry_every: int
 
@@ -1658,6 +1681,8 @@ class WatchdogConfig:
             cooldown_s=_env_int("COOLDOWN", DEFAULT_COOLDOWN_S),
             l3_escalation_threshold=_env_int(
                 "L3_ESCALATION_THRESHOLD", DEFAULT_L3_ESCALATION_THRESHOLD),
+            registration_gate_streak=_env_int(
+                "REGISTRATION_GATE_STREAK", DEFAULT_REGISTRATION_GATE_STREAK),
             router_dead_threshold=_env_int(
                 "ROUTER_DEAD_THRESHOLD", DEFAULT_ROUTER_DEAD_THRESHOLD),
             admin_dead_retry_every=_env_int(
@@ -1681,6 +1706,12 @@ class WatchdogState:
     mtu: MtuGuardState = field(default_factory=MtuGuardState)
     #: Latch so the "no registration" finding is announced once per episode.
     unregistered_announced: bool = False
+    #: Consecutive unregistered readings, so a momentary NO_SERVICE blip cannot
+    #: unlock the reboot rung on its own.
+    unregistered_streak: int = 0
+    #: Set when an L3 attempt failed. The next action prefers L2 over another
+    #: reboot -- see the note at the rung selection in step().
+    retry_l2_after_l3: bool = False
 
 
 @dataclass
@@ -1810,19 +1841,36 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
     # after L3_ESCALATION_THRESHOLD failed L2 attempts spaced a cooldown apart
     # -- roughly ten minutes of guaranteed-useless DISCONNECT/CONNECT calls,
     # each burning L2 breaker budget that a real session fault might need later.
+    #
+    # The gate needs registration_gate_streak CONSECUTIVE unregistered readings
+    # before it fires. Registration flaps on this modem, and a single blip is
+    # not a reason to unlock an eight-minute reboot: on 2026-09-20 the modem
+    # read NO_SERVICE for exactly one 22s window and was back on LTE with five
+    # bars by 20:35:06, yet that one sample jumped the ceiling to L3 and the
+    # ladder spent the next 28 minutes there.
     registered = deps.is_registered()
     if registered is False:
-        if not s.unregistered_announced:
-            _emit(logging.ERROR, TAG_STATE,
-                  "modem has no network registration (Limited Service) -- L2 cannot re-dial "
-                  "a session that does not exist SWITCHING TO ceiling L3 (REBOOT_DEVICE)")
-            s.unregistered_announced = True
-        s.escalation_level = LADDER_TOP_LEVEL
-    elif registered is True and s.unregistered_announced:
-        _emit(logging.INFO, TAG_DETECT, "modem registered again")
-        s.unregistered_announced = False
-    # registered is None: unreadable. Say nothing and let the ladder proceed
-    # normally -- an unreadable router is the liveness gate's concern.
+        s.unregistered_streak += 1
+        if s.unregistered_streak >= cfg.registration_gate_streak:
+            if not s.unregistered_announced:
+                _emit(logging.ERROR, TAG_STATE,
+                      "modem has no network registration for %s consecutive checks "
+                      "(Limited Service) -- L2 cannot re-dial a session that does not "
+                      "exist SWITCHING TO ceiling L3 (REBOOT_DEVICE)", s.unregistered_streak)
+                s.unregistered_announced = True
+            s.escalation_level = LADDER_TOP_LEVEL
+        else:
+            _emit(logging.WARNING, TAG_DETECT,
+                  "modem reads unregistered (%s/%s) -- not yet sustained, ladder unchanged",
+                  s.unregistered_streak, cfg.registration_gate_streak)
+    elif registered is True:
+        s.unregistered_streak = 0
+        if s.unregistered_announced:
+            _emit(logging.INFO, TAG_DETECT, "modem registered again")
+            s.unregistered_announced = False
+    # registered is None: unreadable. Say nothing, leave the streak where it is
+    # and let the ladder proceed normally -- an unreadable router is the
+    # liveness gate's concern.
 
     # EXHAUSTION LATCH: at the top of the ladder with both breaker-gated rungs
     # spent, more software attempts cannot help. Log CRITICAL once, then quiesce
@@ -1848,11 +1896,25 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
     # Select the highest rung within the current ceiling that still has budget,
     # falling back to a cheaper one (L1 has no breaker, so it is always the
     # floor). This keeps useful work flowing instead of spinning on a spent rung.
+    #
+    # A FAILED L3 HANDS THE NEXT TURN BACK TO L2. Re-issuing REBOOT_DEVICE into
+    # a router that just declined to confirm readiness costs ~8 minutes (boot
+    # floor + readiness ceiling + cooldown) and, on the evidence, fixes nothing:
+    # on 2026-09-20 three consecutive L3s failed that way and a single L2
+    # re-dial then restored the link in 39 seconds. An L2 costs ~40s, so it is
+    # the cheap thing to try before spending another reboot.
     chosen_idx = 0
-    for i in range(s.escalation_level - 1, -1, -1):
-        if deps.ladder[i].available(now):
-            chosen_idx = i
-            break
+    if s.retry_l2_after_l3 and deps.ladder[1].available(now):
+        chosen_idx = 1
+        _emit(logging.WARNING, TAG_STATE,
+              "last %s failed SWITCHING TO one L2 re-dial before another reboot",
+              deps.ladder[2].name)
+    else:
+        for i in range(s.escalation_level - 1, -1, -1):
+            if deps.ladder[i].available(now):
+                chosen_idx = i
+                break
+    s.retry_l2_after_l3 = False
     action = deps.ladder[chosen_idx]
 
     _emit(logging.WARNING, TAG_ACTION, "ceiling L%s SWITCHING TO %s", s.escalation_level, action.name)
@@ -1872,6 +1934,11 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
         _emit(logging.INFO, TAG_ACTION, "%s completed SWITCHING TO awaiting effect", action.name)
     else:
         _emit(logging.ERROR, TAG_ACTION, "%s did not complete (see FAULT/DETECT lines above)", action.name)
+
+    # An L3 that failed arms the one-shot L2 retry above. Only L3 does this:
+    # a failed L1 or L2 is already cheap to repeat.
+    if chosen_idx == LADDER_TOP_LEVEL - 1 and not issued:
+        s.retry_l2_after_l3 = True
 
     # Raise the ceiling for next time. Accounting is based on what actually ran:
     # only a real L2 attempt counts toward the L2->L3 escalation; a spent L2
@@ -1929,7 +1996,17 @@ def build_deps(cfg: WatchdogConfig) -> WatchdogDeps:
             CircuitBreaker(l3_max, window_s, "L3"),
             boot_wait_s=boot_wait_s,
             readiness_ceiling_s=readiness_ceiling_s,
-            readiness_probe=lambda: api.is_admin_plane_up() and icmp_ok(ping_target),
+            # READINESS IS "DID THE ROUTER BOOT", NOT "IS THE WAN BACK".
+            # This used to be `is_admin_plane_up() and icmp_ok(ping_target)`.
+            # WAN is exactly what the reboot is trying to restore, so that
+            # conjunction could only be true once the fault had already fixed
+            # itself: every L3 reported FAILED even on a clean boot, the ladder
+            # stayed pinned at ceiling L3, and it re-rebooted a healthy router.
+            # Observed 2026-09-20: reboot at 20:36:18, router back on LTE with
+            # 5 bars at 20:36:30, and still two more reboots at 20:45 and 20:54
+            # before the ladder fell back to L2 -- which restored the link in
+            # 39s. The WAN verdict belongs to the poll loop, not to this rung.
+            readiness_probe=api.is_admin_plane_up,
         ),
     ]
 
@@ -2074,6 +2151,8 @@ from zte_watchdog import (
     SoftRebootRecovery,
     DEFAULT_L3_BOOT_WAIT_S,
     DEFAULT_L3_READINESS_CEILING_S,
+    DEFAULT_REGISTRATION_GATE_STREAK,
+    LADDER_TOP_LEVEL,
     WatchdogConfig,
     WatchdogDeps,
     WatchdogState,
@@ -2498,8 +2577,8 @@ class FakeAction:
 
 def _cfg(**over):
     base = dict(check_interval_s=60, fail_threshold=3, cooldown_s=180,
-                l3_escalation_threshold=3, router_dead_threshold=3,
-                admin_dead_retry_every=10)
+                l3_escalation_threshold=3, registration_gate_streak=3,
+                router_dead_threshold=3, admin_dead_retry_every=10)
     base.update(over)
     return WatchdogConfig(**base)
 
@@ -3096,25 +3175,141 @@ def test_given_unreachable_router_when_reading_mtu_then_none():
 
 
 
+# ---------------------------------------------------------------------------
+# THE 2026-09-20 REBOOT LOOP
+#
+# L3's readiness probe was `is_admin_plane_up() and icmp_ok(ping_target)`. WAN
+# is what the reboot exists to restore, so readiness could only be confirmed
+# once the fault had already cleared: every reboot self-reported FAILED, the
+# ladder stayed pinned at ceiling L3, and it re-rebooted a healthy router three
+# times over 28 minutes. A single L2 re-dial then fixed it in 39 seconds.
+#
+# Two rules come out of that outage and are pinned here:
+#   1. readiness means "the router booted", nothing more;
+#   2. a failed L3 hands the next turn to L2 rather than to another L3.
+# ---------------------------------------------------------------------------
+
+
+def test_given_admin_up_but_wan_down_when_l3_readiness_probes_then_confirmed():
+    r"""\brief The shipped L3 must not gate readiness on the WAN it is restoring."""
+    env = {"ROUTER_PASSWORD": "pw", "MTU_GUARD_ENABLED": "0", "TCP_CHECK_ENABLED": "0"}
+    with patch.dict(os.environ, env, clear=False), \
+         patch.object(ZteRouterApi, "is_admin_plane_up", return_value=True), \
+         patch.object(zte_watchdog, "icmp_ok", return_value=False) as ping:
+        deps = zte_watchdog.build_deps(WatchdogConfig.from_env())
+        l3 = deps.ladder[LADDER_TOP_LEVEL - 1]
+        assert l3._probe() is True, \
+            "L3 readiness still waits on the WAN the reboot is meant to restore"
+        ping.assert_not_called()
+
+
+def test_given_failed_l3_when_step_then_next_action_is_l2_not_another_reboot():
+    r"""GIVEN an L3 that reported FAILED
+        WHEN the next action is due
+        THEN the cheap L2 re-dial runs instead of a second eight-minute reboot."""
+    l1, l2, l3 = FakeAction("L1"), FakeAction("L2"), FakeAction("L3", result=False)
+    deps, _ = _deps(False, True, [], ladder=(l1, l2, l3))
+    cfg = _cfg(cooldown_s=0)
+    s = WatchdogState(consecutive_failures=5, escalation_level=LADDER_TOP_LEVEL)
+    s = step(s, deps, cfg, 1000.0)
+    assert l3.calls == [1000.0] and s.retry_l2_after_l3 is True
+    s = step(s, deps, cfg, 1001.0)
+    assert l2.calls == [1001.0], "re-issued a reboot instead of trying the cheap rung"
+    assert l3.calls == [1000.0]
+    assert s.retry_l2_after_l3 is False
+
+
+def test_given_successful_l3_when_step_then_no_forced_l2_retry():
+    l1, l2, l3 = FakeAction("L1"), FakeAction("L2"), FakeAction("L3", result=True)
+    deps, _ = _deps(False, True, [], ladder=(l1, l2, l3))
+    out = step(WatchdogState(consecutive_failures=5, escalation_level=LADDER_TOP_LEVEL),
+               deps, _cfg(cooldown_s=0), 1000.0)
+    assert out.retry_l2_after_l3 is False
+
+
+def test_given_failed_l3_and_spent_l2_when_step_then_normal_selection():
+    r"""\brief The retry is a preference, not a promise: a spent L2 cannot run."""
+    l1 = FakeAction("L1")
+    l2 = FakeAction("L2", is_available=False)
+    l3 = FakeAction("L3", result=False)
+    deps, _ = _deps(False, True, [], ladder=(l1, l2, l3))
+    s = WatchdogState(consecutive_failures=5, escalation_level=LADDER_TOP_LEVEL,
+                      retry_l2_after_l3=True)
+    out = step(s, deps, _cfg(cooldown_s=0), 1000.0)
+    assert not l2.calls
+    assert l3.calls == [1000.0]
+    assert out.retry_l2_after_l3 is True   # failed again, still armed
+
+
+def test_given_shipped_registration_gate_streak_then_more_than_one_sample():
+    r"""\brief A one-sample gate is what pinned the ladder at L3 on 2026-09-20."""
+    assert DEFAULT_REGISTRATION_GATE_STREAK >= 2
+
+
 # --- registration gate (Limited Service) -------------------------------------
 
 
-def test_given_unregistered_modem_when_step_then_skips_l2_and_fires_l3():
-    r"""GIVEN the modem holds no registration
+# ---------------------------------------------------------------------------
+# THE 2026-09-20 ONE-SAMPLE ESCALATION
+#
+# The modem read NO_SERVICE for a single 22s window (20:34:44 -> 20:35:06) and
+# was back on LTE with five bars seconds later. That one sample jumped the
+# ceiling straight to L3, and the ladder then spent 28 minutes rebooting a
+# router that was already registered. The gate now wants the reading sustained.
+# ---------------------------------------------------------------------------
+
+
+def test_given_sustained_unregistered_modem_when_step_then_skips_l2_and_fires_l3():
+    r"""GIVEN the modem has held no registration for the full streak
         WHEN the threshold is reached
         THEN L3 runs immediately, because there is no session for L2 to re-dial."""
     deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
     cfg = _cfg()
-    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1)
+    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1,
+                      unregistered_streak=cfg.registration_gate_streak - 1)
     step(s, deps, cfg, now=10_000.0)
     assert l3.calls == [10_000.0]
     assert not l2.calls and not l1.calls
 
 
+def test_given_single_unregistered_blip_when_step_then_ceiling_unchanged():
+    r"""\brief One NO_SERVICE sample must not unlock an eight-minute reboot."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
+    cfg = _cfg()
+    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1)
+    out = step(s, deps, cfg, now=10_000.0)
+    assert out.unregistered_streak == 1
+    assert not l3.calls, "a single blip reached the reboot rung"
+    assert l1.calls == [10_000.0]        # ordinary ladder, cheapest rung first
+    assert out.escalation_level == 2
+
+
+def test_given_blip_then_registration_returns_when_step_then_streak_resets():
+    r"""\brief The streak counts CONSECUTIVE readings, so one good one clears it."""
+    cfg = _cfg()
+    deps_down, _ = _deps(False, True, [], registered=False)
+    s = step(WatchdogState(consecutive_failures=cfg.fail_threshold - 1),
+             deps_down, cfg, now=10_000.0)
+    assert s.unregistered_streak == 1
+    deps_up, _ = _deps(False, True, [], registered=True)
+    s = step(s, deps_up, cfg, now=10_000.0 + cfg.cooldown_s + 1)
+    assert s.unregistered_streak == 0
+
+
+def test_given_unreadable_registration_when_step_then_streak_held_not_reset():
+    r"""\brief None means "cannot tell" -- it neither advances nor clears the streak."""
+    deps, _ = _deps(False, True, [], registered=None)
+    cfg = _cfg()
+    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1, unregistered_streak=2)
+    out = step(s, deps, cfg, now=10_000.0)
+    assert out.unregistered_streak == 2
+
+
 def test_given_unregistered_when_step_repeatedly_then_announced_once():
     deps, _ = _deps(False, True, [], registered=False)
     cfg = _cfg()
-    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1)
+    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1,
+                      unregistered_streak=cfg.registration_gate_streak - 1)
     s = step(s, deps, cfg, now=10_000.0)
     assert s.unregistered_announced is True
     s = step(s, deps, cfg, now=10_000.0 + cfg.cooldown_s + 1)
@@ -3128,6 +3323,17 @@ def test_given_registration_returns_when_step_then_latch_clears():
                       unregistered_announced=True)
     s = step(s, deps, cfg, now=10_000.0)
     assert s.unregistered_announced is False
+
+
+def test_given_sustained_unregistered_then_registered_when_step_then_latch_and_streak_clear():
+    deps, _ = _deps(False, True, [], registered=True)
+    cfg = _cfg()
+    s = WatchdogState(consecutive_failures=cfg.fail_threshold - 1,
+                      unregistered_announced=True,
+                      unregistered_streak=cfg.registration_gate_streak)
+    out = step(s, deps, cfg, now=10_000.0)
+    assert out.unregistered_announced is False
+    assert out.unregistered_streak == 0
 
 
 def test_given_registration_unreadable_when_step_then_ladder_behaves_normally():
@@ -3447,6 +3653,7 @@ L2_MAX_PER_WINDOW=${L2_MAX_PER_WINDOW}
 L2_SETTLE=${L2_SETTLE}
 L3_MAX_PER_WINDOW=${L3_MAX_PER_WINDOW}
 L3_ESCALATION_THRESHOLD=${L3_ESCALATION_THRESHOLD}
+REGISTRATION_GATE_STREAK=${REGISTRATION_GATE_STREAK}
 L3_BOOT_WAIT=${L3_BOOT_WAIT}
 L3_READINESS_CEILING=${L3_READINESS_CEILING}
 ROUTER_DEAD_THRESHOLD=${ROUTER_DEAD_THRESHOLD}

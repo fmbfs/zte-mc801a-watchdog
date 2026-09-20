@@ -67,7 +67,7 @@ Ping a public IP every `CHECK_INTERVAL` seconds. After `FAIL_THRESHOLD` consecut
 | **L2** | `DISCONNECT_NETWORK` → `CONNECT_NETWORK` | `L2_MAX_PER_WINDOW` per rolling window |
 | **L3** | `REBOOT_DEVICE` — full soft reboot | `L3_MAX_PER_WINDOW` per rolling window |
 
-Escalation to L3 happens after `L3_ESCALATION_THRESHOLD` consecutive failed L2 attempts. When both breaker-gated rungs are spent, the daemon logs `CRITICAL` once and keeps polling for restoration instead of looping — software has run out of options, and a power-cycle (e.g. a smart plug) is the fallback.
+Escalation to L3 happens after `L3_ESCALATION_THRESHOLD` consecutive failed L2 attempts. An L3 that fails arms exactly one L2 re-dial before another reboot is considered: a reboot costs ~8 minutes (boot floor + readiness ceiling + cooldown) and a re-dial ~40s, and on 2026-09-20 three consecutive failed reboots were followed by a single L2 that restored the link in 39 seconds. When both breaker-gated rungs are spent, the daemon logs `CRITICAL` once and keeps polling for restoration instead of looping — software has run out of options, and a power-cycle (e.g. a smart plug) is the fallback.
 
 **Liveness gate.** If the router's admin HTTP plane is unreachable, no `goform` command can land at all, so the ladder is pointless. That case is logged once as `CRITICAL` and then retried blind every `ADMIN_DEAD_RETRY_EVERY` cycles — a failed probe is evidence, not proof, that the router is gone.
 
@@ -78,7 +78,7 @@ Two different faults look identical from outside — "no internet" — but need 
 - **Wedged data session**: the modem is registered on the carrier, `ppp_connected`, but there is no route. There *is* a session to re-dial, so **L2 is the correct, cheap fix**.
 - **No registration** ("Limited Service" / not attached): there is no session to re-dial, so every L2 attempt is guaranteed to fail. **Only L3 has ever recovered this.**
 
-Before running the ladder, the daemon reads `modem_main_state`, `network_type` and `signalbar` and jumps straight to L3 when the modem holds no usable registration. Without the gate the second case still reaches L3 eventually — but only after `L3_ESCALATION_THRESHOLD` failed L2 attempts a cooldown apart, several minutes of useless `DISCONNECT`/`CONNECT` calls, each burning L2 breaker budget that a real session fault might need later.
+Before running the ladder, the daemon reads `modem_main_state`, `network_type` and `signalbar` and jumps straight to L3 when the modem holds no usable registration for `REGISTRATION_GATE_STREAK` consecutive checks. The streak matters: registration flaps, and on 2026-09-20 a single 22s `NO_SERVICE` sample was enough to pin the ladder at ceiling L3 for 28 minutes while the modem was already back on LTE with full bars. Without the gate the second case still reaches L3 eventually — but only after `L3_ESCALATION_THRESHOLD` failed L2 attempts a cooldown apart, several minutes of useless `DISCONNECT`/`CONNECT` calls, each burning L2 breaker budget that a real session fault might need later.
 
 An unreadable router returns "unknown", never a guess: that is the liveness gate's problem, not this probe's.
 
@@ -230,6 +230,7 @@ All settings are environment variables, stored in `/opt/zte-watchdog/config.env`
 | `L2_SETTLE` | `15` | Seconds between `DISCONNECT` and `CONNECT` |
 | `L3_MAX_PER_WINDOW` | `3` | L3 (reboot) breaker cap per window |
 | `L3_ESCALATION_THRESHOLD` | `2` | Failed L2 attempts before escalating to L3 |
+| `REGISTRATION_GATE_STREAK` | `3` | Consecutive unregistered readings before the registration gate jumps to L3 |
 | `L3_BOOT_WAIT` | `90` | Seconds to wait out a reboot |
 | `ROUTER_DEAD_THRESHOLD` | `3` | Cycles of unreachable admin plane before `CRITICAL` |
 | `ADMIN_DEAD_RETRY_EVERY` | `10` | Cycles between blind ladder retries while admin is dead |
