@@ -1897,12 +1897,11 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
     # falling back to a cheaper one (L1 has no breaker, so it is always the
     # floor). This keeps useful work flowing instead of spinning on a spent rung.
     #
-    # A FAILED L3 HANDS THE NEXT TURN BACK TO L2. Re-issuing REBOOT_DEVICE into
-    # a router that just declined to confirm readiness costs ~8 minutes (boot
-    # floor + readiness ceiling + cooldown) and, on the evidence, fixes nothing:
-    # on 2026-09-20 three consecutive L3s failed that way and a single L2
-    # re-dial then restored the link in 39 seconds. An L2 costs ~40s, so it is
-    # the cheap thing to try before spending another reboot.
+    # AN L3 THAT DID NOT RESTORE THE WAN HANDS THE NEXT TURN BACK TO L2.
+    # Re-issuing REBOOT_DEVICE costs ~5.5 minutes (boot floor + cooldown) and,
+    # on the evidence, fixes nothing: on 2026-09-20 three consecutive L3s ran
+    # and a single L2 re-dial then restored the link in 39 seconds. An L2 costs
+    # ~40s, so it is the cheap thing to try before spending another reboot.
     chosen_idx = 0
     if s.retry_l2_after_l3 and deps.ladder[1].available(now):
         chosen_idx = 1
@@ -1935,9 +1934,14 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
     else:
         _emit(logging.ERROR, TAG_ACTION, "%s did not complete (see FAULT/DETECT lines above)", action.name)
 
-    # An L3 that failed arms the one-shot L2 retry above. Only L3 does this:
-    # a failed L1 or L2 is already cheap to repeat.
-    if chosen_idx == LADDER_TOP_LEVEL - 1 and not issued:
+    # Every L3 arms the one-shot L2 retry above, whether or not readiness
+    # confirmed: if the reboot had restored the WAN, step() would not run
+    # again. Gating on `not issued` made the retry dead code once readiness
+    # stopped requiring WAN -- on 2026-09-21 three reboots each "completed",
+    # the router sat on LTE with five bars and ppp_disconnected after every
+    # one, and no re-dial was ever tried. Only L3 does this: a failed L1 or L2
+    # is already cheap to repeat.
+    if chosen_idx == LADDER_TOP_LEVEL - 1:
         s.retry_l2_after_l3 = True
 
     # Raise the ceiling for next time. Accounting is based on what actually ran:
@@ -3186,7 +3190,8 @@ def test_given_unreachable_router_when_reading_mtu_then_none():
 #
 # Two rules come out of that outage and are pinned here:
 #   1. readiness means "the router booted", nothing more;
-#   2. a failed L3 hands the next turn to L2 rather than to another L3.
+#   2. an L3 that leaves the WAN down hands the next turn to L2 rather than
+#      to another L3 -- including one whose readiness confirmed (2026-09-21).
 # ---------------------------------------------------------------------------
 
 
@@ -3219,12 +3224,20 @@ def test_given_failed_l3_when_step_then_next_action_is_l2_not_another_reboot():
     assert s.retry_l2_after_l3 is False
 
 
-def test_given_successful_l3_when_step_then_no_forced_l2_retry():
+def test_given_completed_l3_and_wan_still_down_when_step_then_next_action_is_l2():
+    r"""GIVEN an L3 whose readiness confirmed but the WAN stayed down
+        WHEN the next action is due
+        THEN L2 re-dials instead of a second reboot (2026-09-21: three
+             "completed" reboots in a row, router on LTE, PPP never dialled)."""
     l1, l2, l3 = FakeAction("L1"), FakeAction("L2"), FakeAction("L3", result=True)
     deps, _ = _deps(False, True, [], ladder=(l1, l2, l3))
-    out = step(WatchdogState(consecutive_failures=5, escalation_level=LADDER_TOP_LEVEL),
-               deps, _cfg(cooldown_s=0), 1000.0)
-    assert out.retry_l2_after_l3 is False
+    cfg = _cfg(cooldown_s=0)
+    s = step(WatchdogState(consecutive_failures=5, escalation_level=LADDER_TOP_LEVEL),
+             deps, cfg, 1000.0)
+    assert s.retry_l2_after_l3 is True
+    s = step(s, deps, cfg, 1001.0)
+    assert l2.calls == [1001.0], "re-issued a reboot instead of re-dialling"
+    assert l3.calls == [1000.0]
 
 
 def test_given_failed_l3_and_spent_l2_when_step_then_normal_selection():
