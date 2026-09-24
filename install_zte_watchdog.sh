@@ -743,6 +743,13 @@ _NETWORK_TYPES_UNREGISTERED = frozenset({
     "limited_service", "searching", "unknown", "",
 })
 
+#: network_type prefixes that mean "no network" whatever radio suffix follows.
+#: The exact-match set above missed this firmware's real reading: every daily
+#: carrier outage (2026-09-21/22/23 captures) reports LIMITED_SERVICE_LTE, so
+#: the registration gate never fired and the ladder spent ~7 minutes on L1 and
+#: two L2 re-dials that cannot dial without an attach. Only L3 recovers it.
+_NETWORK_TYPE_UNREGISTERED_PREFIXES = ("limited_service", "limited service")
+
 #: Every goform request, read or write, carries this. It was repeated at four
 #: call sites before it was named.
 _GOFORM_BASE_PARAMS: Dict[str, str] = {"isTest": "false"}
@@ -1057,7 +1064,7 @@ class ZteRouterApi:
             _emit(logging.WARNING, TAG_DETECT,
                   "modem_main_state=%r indicates no usable registration", data.get("modem_main_state"))
             return False
-        if net in _NETWORK_TYPES_UNREGISTERED:
+        if net in _NETWORK_TYPES_UNREGISTERED or net.startswith(_NETWORK_TYPE_UNREGISTERED_PREFIXES):
             _emit(logging.WARNING, TAG_DETECT,
                   "network_type=%r -- modem is not attached to a network", data.get("network_type"))
             return False
@@ -1971,7 +1978,25 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
 
     # global cooldown between recovery actions
     remaining = cfg.cooldown_s - (now - s.last_action_time)
-    if remaining > 0:
+    # ...except when the registration gate has just fired and all the cooldown
+    # would protect is an L1 CONNECT. L1 returns instantly and cannot dial
+    # without an attach, so there is no action in flight to wait out: on
+    # 2026-09-23 the gate would have sat out ~140s of a 180s cooldown before
+    # the reboot that actually recovers the daily outage. Only L1 qualifies --
+    # after L2 or L3 the cooldown still guards a router that may be mid-dial or
+    # mid-boot (the 2026-09-08 double reboot).
+    gate_skips_cooldown = (
+        registered is False
+        and s.unregistered_streak >= cfg.registration_gate_streak
+        and s.last_action_name == deps.ladder[0].name
+        and deps.ladder[LADDER_TOP_LEVEL - 1].available(now)
+    )
+    if remaining > 0 and gate_skips_cooldown:
+        _emit(logging.WARNING, TAG_STATE,
+              "registration gate: last action was %s, nothing to wait for "
+              "SWITCHING TO %s now (skipping %.0fs cooldown)",
+              s.last_action_name, deps.ladder[LADDER_TOP_LEVEL - 1].name, remaining)
+    elif remaining > 0:
         _emit(logging.INFO, TAG_STATE, "threshold hit but in cooldown (%.0fs remaining) SWITCHING TO wait", remaining)
         return s
 
@@ -3536,6 +3561,50 @@ def test_given_sustained_unregistered_modem_when_step_then_skips_l2_and_fires_l3
     assert not l2.calls and not l1.calls
 
 
+def _gate_after_l1_state(cfg, last_action_name, now):
+    r"""\brief Mid-cooldown, one reading short of the gate, after `last_action_name`."""
+    return WatchdogState(consecutive_failures=cfg.fail_threshold + 1,
+                         unregistered_streak=cfg.registration_gate_streak - 1,
+                         last_action_time=now - 40, last_action_name=last_action_name)
+
+
+def test_given_gate_fires_after_l1_when_step_then_l3_skips_cooldown():
+    r"""GIVEN the daily outage: L1 fired at detection, the modem reads
+        LIMITED_SERVICE_LTE and the gate reaches its streak 40s later
+        WHEN step runs inside the L1 cooldown
+        THEN L3 fires now -- an instant, useless L1 leaves nothing to wait for."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
+    cfg = _cfg()
+    step(_gate_after_l1_state(cfg, "L1", 10_000.0), deps, cfg, now=10_000.0)
+    assert l3.calls == [10_000.0]
+    assert not l1.calls and not l2.calls
+
+
+def test_given_gate_fires_after_l2_or_l3_when_step_then_cooldown_still_holds():
+    r"""\brief After L2 or L3 the router may be mid-dial or mid-boot: wait it out."""
+    for last in ("L2", "L3"):
+        deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
+        cfg = _cfg()
+        step(_gate_after_l1_state(cfg, last, 10_000.0), deps, cfg, now=10_000.0)
+        assert not (l1.calls or l2.calls or l3.calls), last
+
+
+def test_given_gate_fires_after_l1_but_l3_spent_when_step_then_cooldown_still_holds():
+    r"""\brief Without an L3 to jump to, skipping the cooldown would just spam L1."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=False, avail=(True, True, False))
+    cfg = _cfg()
+    step(_gate_after_l1_state(cfg, "L1", 10_000.0), deps, cfg, now=10_000.0)
+    assert not (l1.calls or l2.calls or l3.calls)
+
+
+def test_given_registered_modem_after_l1_when_step_then_cooldown_still_holds():
+    r"""\brief The skip belongs to the gate alone; a normal outage keeps its pacing."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=True)
+    cfg = _cfg()
+    step(_gate_after_l1_state(cfg, "L1", 10_000.0), deps, cfg, now=10_000.0)
+    assert not (l1.calls or l2.calls or l3.calls)
+
+
 def test_given_single_unregistered_blip_when_step_then_ceiling_unchanged():
     r"""\brief One NO_SERVICE sample must not unlock an eight-minute reboot."""
     deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
@@ -3647,6 +3716,13 @@ def test_given_healthy_capture_when_is_registered_then_true():
 def test_given_limited_service_network_type_when_is_registered_then_false():
     f = dict(_HEALTHY, network_type="Limited Service")
     assert _api_reg(f).is_registered() is False
+
+
+def test_given_limited_service_with_radio_suffix_when_is_registered_then_false():
+    r"""The value this firmware actually reports during the daily outage."""
+    for value in ("LIMITED_SERVICE_LTE", "LIMITED_SERVICE_NR5G", "Limited Service LTE"):
+        f = dict(_HEALTHY, network_type=value, signalbar="")
+        assert _api_reg(f).is_registered() is False, value
 
 
 def test_given_zero_signal_bars_when_is_registered_then_false():
