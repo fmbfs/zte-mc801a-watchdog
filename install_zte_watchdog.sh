@@ -53,6 +53,11 @@ PING_TARGET="${PING_TARGET:-1.1.1.1}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-20}"
 FAIL_THRESHOLD="${FAIL_THRESHOLD:-3}"
 COOLDOWN="${COOLDOWN:-180}"
+# How long after a rung FINISHES its effect may still plausibly show up.
+# Recovery inside this window is credited to that rung; recovery outside it
+# is logged as NOT the ladder's doing (external or manual). Diagnostic only:
+# it changes no recovery behaviour, just what the journal claims.
+ATTRIBUTION_WINDOW="${ATTRIBUTION_WINDOW:-90}"
 
 # A cached router login older than this is re-authenticated before use. The
 # stok is otherwise only dropped reactively, by a request that has already
@@ -231,7 +236,10 @@ trying to restore, so gating on it made every reboot self-report FAILED, pinned
 the ladder at ceiling L3 and re-rebooted a healthy router. An L3 that does fail
 arms a single L2 re-dial before another reboot is considered -- L2 costs ~40s
 against L3's ~8 minutes, and on 2026-09-20 it was the rung that actually
-restored the link.
+restored the link. Because readiness stops at "booted", a confirmed L3 then
+issues one CONNECT_NETWORK itself: the router comes back undialled, and
+waiting out a cooldown before dialling is a dead window a human keeps filling
+by hand (2026-09-22).
 
 Everything lives in this one file on purpose (mirrors the original installer's
 single-daemon layout); the OO seams (CircuitBreaker, RecoveryAction Protocol,
@@ -389,6 +397,12 @@ DEFAULT_CHECK_INTERVAL_S = 20
 DEFAULT_FAIL_THRESHOLD = 3
 #: Seconds between recovery attempts.
 DEFAULT_COOLDOWN_S = 180
+#: How long after a rung FINISHES its effect may still plausibly show up, for
+#: the purpose of crediting a recovery to it. A dial (L1/L2, and the post-boot
+#: CONNECT an L3 now issues) lands in seconds; 90 is generous. Past this the
+#: ladder is just sitting out its cooldown, so a link that returns is somebody
+#: else's doing -- see _attribute_recovery().
+DEFAULT_ATTRIBUTION_WINDOW_S = 90
 #: Seconds a cached login is trusted before ensure_login() forces a fresh one.
 DEFAULT_SESSION_MAX_AGE_S = 300
 #: Failed L2 attempts before escalating to L3. At 3, with a 180s cooldown, the
@@ -729,6 +743,13 @@ _NETWORK_TYPES_UNREGISTERED = frozenset({
     "limited_service", "searching", "unknown", "",
 })
 
+#: network_type prefixes that mean "no network" whatever radio suffix follows.
+#: The exact-match set above missed this firmware's real reading: every daily
+#: carrier outage (2026-09-21/22/23 captures) reports LIMITED_SERVICE_LTE, so
+#: the registration gate never fired and the ladder spent ~7 minutes on L1 and
+#: two L2 re-dials that cannot dial without an attach. Only L3 recovers it.
+_NETWORK_TYPE_UNREGISTERED_PREFIXES = ("limited_service", "limited service")
+
 #: Every goform request, read or write, carries this. It was repeated at four
 #: call sites before it was named.
 _GOFORM_BASE_PARAMS: Dict[str, str] = {"isTest": "false"}
@@ -1043,7 +1064,7 @@ class ZteRouterApi:
             _emit(logging.WARNING, TAG_DETECT,
                   "modem_main_state=%r indicates no usable registration", data.get("modem_main_state"))
             return False
-        if net in _NETWORK_TYPES_UNREGISTERED:
+        if net in _NETWORK_TYPES_UNREGISTERED or net.startswith(_NETWORK_TYPE_UNREGISTERED_PREFIXES):
             _emit(logging.WARNING, TAG_DETECT,
                   "network_type=%r -- modem is not attached to a network", data.get("network_type"))
             return False
@@ -1320,6 +1341,27 @@ class SoftRebootRecovery:
             return False
         _emit(logging.WARNING, TAG_ACTION, "REBOOT_DEVICE issued SWITCHING TO boot wait")
         if self._wait_for_boot():
+            # A REBOOT THAT CAME BACK STILL HAS TO DIAL.
+            # readiness_probe is is_admin_plane_up: it answers "did the router
+            # boot", deliberately NOT "is the WAN back" (see the wiring note in
+            # main()). The consequence nobody closed: an MC801A that has just
+            # booted comes up with its data session DOWN, so a confirmed-ready
+            # reboot lands in precisely the state a plain CONNECT_NETWORK fixes
+            # -- and this rung issued none. step() stamps its cooldown when
+            # attempt() RETURNS, so the ladder then sat idle for the full
+            # COOLDOWN on a router that was booted, reachable and undialled.
+            # Observed 2026-09-22: reboot 21:22:49, readiness 21:25:19,
+            # cooldown to 21:28:16, and the link came back at 21:25:59 only
+            # because the connection was toggled on by hand in the router UI
+            # -- which is this same CONNECT_NETWORK. ~1s against a ~3min dead
+            # window. A failure here is not fatal: the L2 re-dial that every
+            # L3 arms still runs once the cooldown expires.
+            if self._api.ensure_login() and self._api.connect_network():
+                _emit(logging.INFO, TAG_ACTION,
+                      "post-boot CONNECT issued SWITCHING TO awaiting effect")
+            else:
+                _emit(logging.WARNING, TAG_ACTION,
+                      "post-boot CONNECT failed -- leaving the re-dial to the armed L2 retry")
             return True
         # The command was accepted but the router never came back within the
         # ceiling. Reporting that as a completed action is what let the ladder
@@ -1671,6 +1713,7 @@ class WatchdogConfig:
     registration_gate_streak: int
     router_dead_threshold: int
     admin_dead_retry_every: int
+    attribution_window_s: int = DEFAULT_ATTRIBUTION_WINDOW_S
 
     @staticmethod
     def from_env() -> "WatchdogConfig":
@@ -1687,6 +1730,8 @@ class WatchdogConfig:
                 "ROUTER_DEAD_THRESHOLD", DEFAULT_ROUTER_DEAD_THRESHOLD),
             admin_dead_retry_every=_env_int(
                 "ADMIN_DEAD_RETRY_EVERY", DEFAULT_ADMIN_DEAD_RETRY_EVERY),
+            attribution_window_s=_env_int(
+                "ATTRIBUTION_WINDOW", DEFAULT_ATTRIBUTION_WINDOW_S),
         )
 
 
@@ -1700,6 +1745,10 @@ class WatchdogState:
     router_dead_streak: int = 0
     admin_dead_announced: bool = False
     last_action_time: float = 0.0
+    #: Name of the rung that ran last this episode, or None if none has. Paired
+    #: with last_action_time (stamped when the action FINISHED) this is what
+    #: lets a restore say whether the ladder can honestly take the credit.
+    last_action_name: Optional[str] = None
     exhausted: bool = False  # latch: software recovery spent (quiesce, log once)
     #: MTU-guard state. Lives here (not in a module global) so the happy path
     #: can carry it across cycles -- see the note in step().
@@ -1747,6 +1796,45 @@ class WatchdogDeps:
 # --- pure per-cycle decision -------------------------------------------------
 
 
+def _attribute_recovery(s: WatchdogState, cfg: WatchdogConfig, now: float) -> None:
+    r"""
+    \brief Say whether the ladder can honestly take credit for a recovery.
+
+    \details "connectivity restored (was level 3)" is inferred from the poll
+    loop alone: it means the WAN came back, NOT that the last rung brought it
+    back. Read as a success it silently inflates every rung's hit rate, and the
+    2026-09-20/21/22 outages were all "restored (was level 3)" in the journal
+    while a human was actually toggling the connection on in the router UI. A
+    watchdog that cannot tell its own fixes from someone else's cannot be tuned
+    from its own logs.
+
+    Attribution here is a time argument, not a causal proof: last_action_time is
+    stamped when the rung FINISHED, so a link that returns within the window is
+    plausibly that rung's doing, and one that returns while the ladder is idle
+    in cooldown is plausibly not. Both lines say which they are.
+
+    \param s    State carrying last_action_name / last_action_time.
+    \param cfg  Supplies attribution_window_s.
+    \param now  Current epoch time, in seconds.
+    """
+    if s.last_action_name is None:
+        _emit(logging.INFO, TAG_STATE,
+              "recovery attribution: no rung ran this episode -- the link returned on its own")
+        return
+    elapsed = max(0.0, now - s.last_action_time)
+    if elapsed <= cfg.attribution_window_s:
+        _emit(logging.INFO, TAG_STATE,
+              "recovery attribution: link returned %.0fs after %s finished "
+              "(within the %ss window) -- credited to that rung",
+              elapsed, s.last_action_name, cfg.attribution_window_s)
+    else:
+        _emit(logging.WARNING, TAG_STATE,
+              "recovery attribution: link returned %.0fs after %s finished, outside the %ss "
+              "window -- NOT credited to the ladder; the watchdog was idle in cooldown when "
+              "the link came back (external recovery or manual intervention)",
+              elapsed, s.last_action_name, cfg.attribution_window_s)
+
+
 def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: float) -> WatchdogState:
     r"""
     \brief Decide and act for exactly one poll cycle. Pure w.r.t. `state`.
@@ -1764,6 +1852,7 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
         if s.consecutive_failures or s.escalation_level > 1:
             _emit(logging.INFO, TAG_STATE, "connectivity restored (was level %s after %s failed checks) SWITCHING TO normal polling",
                   s.escalation_level, s.consecutive_failures)
+            _attribute_recovery(s, cfg, now)
         else:
             _emit(logging.DEBUG, TAG_HEARTBEAT, "ping ok")
         # "Reachable" is not "usable": a path-MTU black hole passes small ICMP
@@ -1889,7 +1978,25 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
 
     # global cooldown between recovery actions
     remaining = cfg.cooldown_s - (now - s.last_action_time)
-    if remaining > 0:
+    # ...except when the registration gate has just fired and all the cooldown
+    # would protect is an L1 CONNECT. L1 returns instantly and cannot dial
+    # without an attach, so there is no action in flight to wait out: on
+    # 2026-09-23 the gate would have sat out ~140s of a 180s cooldown before
+    # the reboot that actually recovers the daily outage. Only L1 qualifies --
+    # after L2 or L3 the cooldown still guards a router that may be mid-dial or
+    # mid-boot (the 2026-09-08 double reboot).
+    gate_skips_cooldown = (
+        registered is False
+        and s.unregistered_streak >= cfg.registration_gate_streak
+        and s.last_action_name == deps.ladder[0].name
+        and deps.ladder[LADDER_TOP_LEVEL - 1].available(now)
+    )
+    if remaining > 0 and gate_skips_cooldown:
+        _emit(logging.WARNING, TAG_STATE,
+              "registration gate: last action was %s, nothing to wait for "
+              "SWITCHING TO %s now (skipping %.0fs cooldown)",
+              s.last_action_name, deps.ladder[LADDER_TOP_LEVEL - 1].name, remaining)
+    elif remaining > 0:
         _emit(logging.INFO, TAG_STATE, "threshold hit but in cooldown (%.0fs remaining) SWITCHING TO wait", remaining)
         return s
 
@@ -1929,6 +2036,7 @@ def step(state: WatchdogState, deps: WatchdogDeps, cfg: WatchdogConfig, now: flo
     started = deps.clock()
     issued = action.attempt(now)
     s.last_action_time = now + max(0.0, deps.clock() - started)
+    s.last_action_name = action.name
     if issued:
         _emit(logging.INFO, TAG_ACTION, "%s completed SWITCHING TO awaiting effect", action.name)
     else:
@@ -2084,8 +2192,9 @@ def main() -> None:
         _emit(logging.ERROR, TAG_FAULT,
               "invalid LOG_LEVEL=%r -- using %s (valid: DEBUG, INFO, WARNING, ERROR, "
               "CRITICAL, or a number)", _BAD_LOG_LEVEL, DEFAULT_LOG_LEVEL)
-    _emit(logging.INFO, TAG_LIFECYCLE, "starting: interval=%ss threshold=%s cooldown=%ss L3-after=%s L2-fails admin-dead-after=%s cycles",
-          cfg.check_interval_s, cfg.fail_threshold, cfg.cooldown_s, cfg.l3_escalation_threshold, cfg.router_dead_threshold)
+    _emit(logging.INFO, TAG_LIFECYCLE, "starting: interval=%ss threshold=%s cooldown=%ss L3-after=%s L2-fails admin-dead-after=%s cycles attribution-window=%ss",
+          cfg.check_interval_s, cfg.fail_threshold, cfg.cooldown_s, cfg.l3_escalation_threshold, cfg.router_dead_threshold,
+          cfg.attribution_window_s)
     _emit(logging.INFO, TAG_LIFECYCLE, "log level: %s (LOG_LEVEL)",
           logging.getLevelName(_LOG_LEVEL))
     deps = build_deps(cfg)
@@ -2522,6 +2631,65 @@ def test_given_reboot_issued_but_readiness_never_confirmed_when_attempt_then_fal
     api.reboot_device.assert_called_once()
 
 
+# ---------------------------------------------------------------------------
+# THE 2026-09-22 DEAD WINDOW
+#
+# Live sequence: L1, L2, L2, then L3 at 21:22:49. The reboot worked -- the
+# admin plane confirmed readiness at 21:25:19 -- but readiness stops at
+# "booted", and the router comes back with its data session DOWN. step()
+# stamps the cooldown when attempt() returns, so the ladder went quiet until
+# 21:28:16 on a booted, reachable, undialled router. The link came back at
+# 21:25:59 because the connection was toggled on by hand in the router UI:
+# a CONNECT_NETWORK, the one command the rung was not sending.
+# ---------------------------------------------------------------------------
+
+
+def test_given_confirmed_reboot_when_attempt_then_dials_after_boot():
+    r"""\brief A reboot that came back must issue its own post-boot CONNECT."""
+    api = _api_all_ok()
+    order: list = []
+    api.reboot_device.side_effect = lambda: (order.append("reboot"), True)[1]
+    api.connect_network.side_effect = lambda: (order.append("conn"), True)[1]
+    br = CircuitBreaker(3, 86400, "L3")
+    l3 = SoftRebootRecovery(api, br, boot_wait_s=0.0, readiness_probe=lambda: True,
+                            sleep=lambda _s: None)
+    assert l3.attempt(1000.0) is True
+    assert order == ["reboot", "conn"], "confirmed reboot left the router undialled"
+
+
+def test_given_unconfirmed_reboot_when_attempt_then_no_post_boot_dial():
+    r"""
+    \brief Only a CONFIRMED reboot dials.
+
+    \details A router that never answered the readiness probe is not going to
+    accept CONNECT_NETWORK either, and the rung must still report FAILED so
+    the armed L2 retry and the exhaustion latch both see the truth.
+    """
+    api = _api_all_ok()
+    br = CircuitBreaker(3, 86400, "L3")
+    l3 = SoftRebootRecovery(api, br, boot_wait_s=0.0, readiness_ceiling_s=1.0,
+                            readiness_probe=lambda: False, sleep=lambda _s: None)
+    assert l3.attempt(1000.0) is False
+    api.connect_network.assert_not_called()
+
+
+def test_given_post_boot_dial_fails_when_attempt_then_reboot_still_succeeded():
+    r"""
+    \brief A failed post-boot dial must not turn a good reboot into a failure.
+
+    \details The reboot itself is what L3 is accountable for. If the dial does
+    not land, the L2 re-dial that every L3 arms still runs after the cooldown;
+    reporting FAILED here would instead spend another ~8-minute reboot.
+    """
+    api = _api_all_ok()
+    api.connect_network.return_value = False
+    br = CircuitBreaker(3, 86400, "L3")
+    l3 = SoftRebootRecovery(api, br, boot_wait_s=0.0, readiness_probe=lambda: True,
+                            sleep=lambda _s: None)
+    assert l3.attempt(1000.0) is True
+    api.connect_network.assert_called_once()
+
+
 def test_given_no_readiness_probe_when_attempt_then_still_true():
     r"""\brief Absence of a probe is not disconfirming -- keep the old contract."""
     api = _api_all_ok()
@@ -2789,6 +2957,114 @@ def test_given_exhausted_then_wan_restored_when_step_then_latch_clears():
                deps, _cfg(), 1000.0)
     assert out.exhausted is False
     assert out.escalation_level == 1
+
+
+# ---------------------------------------------------------------------------
+# RECOVERY ATTRIBUTION
+#
+# "connectivity restored (was level 3)" only ever meant "the WAN is back", not
+# "the last rung brought it back". The 2026-09-20/21/22 outages each logged it
+# while a human was toggling the connection on in the router UI, so every rung
+# looked more effective in the journal than it was. The restore line now says
+# which of the two it is, on a time argument: last_action_time is stamped when
+# the rung FINISHED, so recovery inside ATTRIBUTION_WINDOW is plausibly that
+# rung's and recovery while the ladder sits in cooldown is plausibly not.
+# ---------------------------------------------------------------------------
+
+
+def _restore_msgs(caplog, st, now=1000.0, **cfg_over):
+    r"""\brief Run step() on a restored WAN and return the emitted messages."""
+    deps, _ = _deps(True, True, [])
+    with caplog.at_level(logging.DEBUG):
+        step(st, deps, _cfg(**cfg_over), now)
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_given_recovery_inside_window_when_step_then_credited_to_the_rung(caplog):
+    r"""\brief A link back 30s after L2 finished is credited to L2."""
+    st = WatchdogState(consecutive_failures=5, escalation_level=2,
+                       last_action_name="L2:DISCONNECT_CONNECT", last_action_time=970.0)
+    msgs = _restore_msgs(caplog, st, attribution_window_s=90)
+    hit = [m for m in msgs if "recovery attribution" in m]
+    assert len(hit) == 1, msgs
+    assert "credited to that rung" in hit[0]
+    assert "L2:DISCONNECT_CONNECT" in hit[0] and "30s" in hit[0]
+    assert "NOT credited" not in hit[0]
+
+
+def test_given_recovery_outside_window_when_step_then_not_credited(caplog):
+    r"""
+    \brief The 2026-09-22 shape: the link came back while the ladder was idle.
+
+    \details Reboot finished at 21:25:19, the link returned at 21:25:59 because
+    the connection was toggled on by hand, and the ladder's next move was not
+    due until 21:28:16. That must not read as an L3 success.
+    """
+    st = WatchdogState(consecutive_failures=35, escalation_level=3,
+                       last_action_name="L3:REBOOT_DEVICE", last_action_time=800.0)
+    msgs = _restore_msgs(caplog, st, attribution_window_s=90)
+    hit = [m for m in msgs if "recovery attribution" in m]
+    assert len(hit) == 1, msgs
+    assert "NOT credited to the ladder" in hit[0]
+    assert "manual intervention" in hit[0]
+    assert "200s" in hit[0]
+
+
+def test_given_no_rung_ran_when_step_then_attribution_says_self_healed(caplog):
+    r"""\brief A blip that cleared before the ladder acted credits nobody."""
+    st = WatchdogState(consecutive_failures=2, escalation_level=1)
+    msgs = _restore_msgs(caplog, st)
+    hit = [m for m in msgs if "recovery attribution" in m]
+    assert len(hit) == 1, msgs
+    assert "no rung ran this episode" in hit[0]
+
+
+def test_given_quiet_happy_cycle_when_step_then_no_attribution_line(caplog):
+    r"""\brief Attribution belongs to a restore, not to every healthy poll."""
+    msgs = _restore_msgs(caplog, WatchdogState())
+    assert not [m for m in msgs if "recovery attribution" in m], msgs
+
+
+def test_given_recovery_exactly_at_window_edge_when_step_then_credited(caplog):
+    r"""\brief The window is inclusive -- the boundary is not a silent flip."""
+    st = WatchdogState(consecutive_failures=5, escalation_level=2,
+                       last_action_name="L1:CONNECT", last_action_time=910.0)
+    msgs = _restore_msgs(caplog, st, attribution_window_s=90)
+    hit = [m for m in msgs if "recovery attribution" in m]
+    assert "credited to that rung" in hit[0] and "NOT credited" not in hit[0]
+
+
+def test_given_clock_skew_when_step_then_elapsed_never_negative(caplog):
+    r"""
+    \brief A rung stamped in the future must not print a negative age.
+
+    \details last_action_time is `now` plus however long attempt() blocked, so
+    a long L3 can land slightly ahead of the next cycle's `now`.
+    """
+    st = WatchdogState(consecutive_failures=5, escalation_level=3,
+                       last_action_name="L3:REBOOT_DEVICE", last_action_time=1050.0)
+    msgs = _restore_msgs(caplog, st, attribution_window_s=90)
+    hit = [m for m in msgs if "recovery attribution" in m]
+    assert "-" not in hit[0].split("returned")[1].split("after")[0]
+    assert "credited to that rung" in hit[0]
+
+
+def test_given_action_runs_when_step_then_records_which_rung_ran():
+    r"""\brief Attribution is only possible if step() remembers the rung."""
+    deps, (l1, _, _) = _deps(False, True, [])
+    out = step(WatchdogState(consecutive_failures=3, escalation_level=1),
+               deps, _cfg(cooldown_s=0), 1000.0)
+    assert l1.calls == [1000.0]
+    assert out.last_action_name == "L1"
+
+
+def test_given_restore_when_step_then_action_name_is_cleared():
+    r"""\brief A fresh episode must not inherit the last one's rung."""
+    deps, _ = _deps(True, True, [])
+    out = step(WatchdogState(consecutive_failures=5, escalation_level=3,
+                             last_action_name="L3:REBOOT_DEVICE", last_action_time=990.0),
+               deps, _cfg(), 1000.0)
+    assert out.last_action_name is None
 
 
 def test_given_ceiling_2_but_l2_spent_when_step_then_l1_runs_and_unlocks_l3():
@@ -3285,6 +3561,50 @@ def test_given_sustained_unregistered_modem_when_step_then_skips_l2_and_fires_l3
     assert not l2.calls and not l1.calls
 
 
+def _gate_after_l1_state(cfg, last_action_name, now):
+    r"""\brief Mid-cooldown, one reading short of the gate, after `last_action_name`."""
+    return WatchdogState(consecutive_failures=cfg.fail_threshold + 1,
+                         unregistered_streak=cfg.registration_gate_streak - 1,
+                         last_action_time=now - 40, last_action_name=last_action_name)
+
+
+def test_given_gate_fires_after_l1_when_step_then_l3_skips_cooldown():
+    r"""GIVEN the daily outage: L1 fired at detection, the modem reads
+        LIMITED_SERVICE_LTE and the gate reaches its streak 40s later
+        WHEN step runs inside the L1 cooldown
+        THEN L3 fires now -- an instant, useless L1 leaves nothing to wait for."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
+    cfg = _cfg()
+    step(_gate_after_l1_state(cfg, "L1", 10_000.0), deps, cfg, now=10_000.0)
+    assert l3.calls == [10_000.0]
+    assert not l1.calls and not l2.calls
+
+
+def test_given_gate_fires_after_l2_or_l3_when_step_then_cooldown_still_holds():
+    r"""\brief After L2 or L3 the router may be mid-dial or mid-boot: wait it out."""
+    for last in ("L2", "L3"):
+        deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
+        cfg = _cfg()
+        step(_gate_after_l1_state(cfg, last, 10_000.0), deps, cfg, now=10_000.0)
+        assert not (l1.calls or l2.calls or l3.calls), last
+
+
+def test_given_gate_fires_after_l1_but_l3_spent_when_step_then_cooldown_still_holds():
+    r"""\brief Without an L3 to jump to, skipping the cooldown would just spam L1."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=False, avail=(True, True, False))
+    cfg = _cfg()
+    step(_gate_after_l1_state(cfg, "L1", 10_000.0), deps, cfg, now=10_000.0)
+    assert not (l1.calls or l2.calls or l3.calls)
+
+
+def test_given_registered_modem_after_l1_when_step_then_cooldown_still_holds():
+    r"""\brief The skip belongs to the gate alone; a normal outage keeps its pacing."""
+    deps, (l1, l2, l3) = _deps(False, True, [], registered=True)
+    cfg = _cfg()
+    step(_gate_after_l1_state(cfg, "L1", 10_000.0), deps, cfg, now=10_000.0)
+    assert not (l1.calls or l2.calls or l3.calls)
+
+
 def test_given_single_unregistered_blip_when_step_then_ceiling_unchanged():
     r"""\brief One NO_SERVICE sample must not unlock an eight-minute reboot."""
     deps, (l1, l2, l3) = _deps(False, True, [], registered=False)
@@ -3398,6 +3718,13 @@ def test_given_limited_service_network_type_when_is_registered_then_false():
     assert _api_reg(f).is_registered() is False
 
 
+def test_given_limited_service_with_radio_suffix_when_is_registered_then_false():
+    r"""The value this firmware actually reports during the daily outage."""
+    for value in ("LIMITED_SERVICE_LTE", "LIMITED_SERVICE_NR5G", "Limited Service LTE"):
+        f = dict(_HEALTHY, network_type=value, signalbar="")
+        assert _api_reg(f).is_registered() is False, value
+
+
 def test_given_zero_signal_bars_when_is_registered_then_false():
     f = dict(_HEALTHY, signalbar="0")
     assert _api_reg(f).is_registered() is False
@@ -3443,6 +3770,7 @@ _INSTALLER_TO_CONSTANT = {
     "CHECK_INTERVAL": "DEFAULT_CHECK_INTERVAL_S",
     "FAIL_THRESHOLD": "DEFAULT_FAIL_THRESHOLD",
     "COOLDOWN": "DEFAULT_COOLDOWN_S",
+    "ATTRIBUTION_WINDOW": "DEFAULT_ATTRIBUTION_WINDOW_S",
     "SESSION_MAX_AGE": "DEFAULT_SESSION_MAX_AGE_S",
     "L2_SETTLE": "DEFAULT_L2_SETTLE_S",
     "L2_MAX_PER_WINDOW": "DEFAULT_L2_MAX_PER_WINDOW",
@@ -3661,6 +3989,7 @@ PING_TARGET=${PING_TARGET}
 CHECK_INTERVAL=${CHECK_INTERVAL}
 FAIL_THRESHOLD=${FAIL_THRESHOLD}
 COOLDOWN=${COOLDOWN}
+ATTRIBUTION_WINDOW=${ATTRIBUTION_WINDOW}
 SESSION_MAX_AGE=${SESSION_MAX_AGE}
 L2_MAX_PER_WINDOW=${L2_MAX_PER_WINDOW}
 L2_SETTLE=${L2_SETTLE}

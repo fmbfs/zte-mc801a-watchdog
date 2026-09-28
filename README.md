@@ -225,6 +225,7 @@ All settings are environment variables, stored in `/opt/zte-watchdog/config.env`
 | `CHECK_INTERVAL` | `20` | Seconds between checks |
 | `FAIL_THRESHOLD` | `3` | Consecutive failures before acting |
 | `COOLDOWN` | `180` | Seconds between recovery attempts, measured from when the previous attempt *finished*. L3 blocks for the whole boot wait, so this is time after the router is back (or the readiness ceiling gave up), not time since the reboot was issued. |
+| `ATTRIBUTION_WINDOW` | `90` | Seconds after a rung *finishes* within which a recovery is still credited to it. Past this the ladder is only sitting out its cooldown, so a link that returns is logged as **not** the ladder's doing (external or manual). Diagnostic only: it changes no recovery behaviour. |
 | `SESSION_MAX_AGE` | `300` | Seconds a cached router login is trusted before re-authenticating |
 | `L2_MAX_PER_WINDOW` | `8` | L2 breaker cap per window |
 | `L2_SETTLE` | `15` | Seconds between `DISCONNECT` and `CONNECT` |
